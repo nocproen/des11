@@ -1,0 +1,18 @@
+# 依赖包
+node_modules/
+
+# nextjs构建产物
+.next/
+.next-old-*/
+tsconfig.tsbuildinfo
+
+# 环境变量
+.env
+.env.local
+
+# 日志
+npm-debug.log
+
+.env.*
+!.env.example
+test-results/
