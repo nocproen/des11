@@ -60,10 +60,11 @@ export function ensureAuthTables() {
     await db.execute(sql`create table if not exists auth_config (key text primary key, value text not null)`);
     await db.execute(sql`create table if not exists admin_users (
       id serial primary key,
-      username text not null unique,
+      username text not null,
       password_hash text not null,
       must_change boolean not null default false,
-      created_at timestamptz not null default now()
+      created_at timestamptz not null default now(),
+      constraint admin_users_username_unique unique (username)
     )`);
     const [{ n }] = await db.select({ n: sql<number>`count(*)::int` }).from(adminUsers);
     if (n === 0) {

@@ -44,8 +44,9 @@ function initial(): DeployStatus {
     message: "",
     log: "",
     buildId: process.env.NEXT_PUBLIC_WD_BUILD ?? "",
-    autoUpdate: process.env.AUTO_UPDATE !== "0",
-    restartOnUpdate: process.env.UPDATE_RESTART !== "0",
+    // Automatic updates and self-exit are opt-in so unmanaged hosts do not go offline.
+    autoUpdate: process.env.AUTO_UPDATE === "1",
+    restartOnUpdate: process.env.UPDATE_RESTART === "1",
     intervalMin: Math.max(1, Number(process.env.UPDATE_INTERVAL_MIN || 10) || 10),
     remoteUrl: "",
   };
@@ -159,7 +160,9 @@ export async function applyUpdate(): Promise<DeployStatus> {
     st.running = false;
     if (code === 0) {
       st.lastResult = "ok";
-      st.message = "更新完成，服务即将重启";
+      st.message = st.restartOnUpdate
+        ? "更新构建完成，服务即将由进程管理器重启"
+        : "更新构建完成；请通过部署平台重启服务以加载新版本";
       void checkRemote(false);
       if (st.restartOnUpdate) {
         // 给响应一点时间发出去，再退出进程让平台重新拉起新版本

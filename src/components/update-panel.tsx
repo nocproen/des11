@@ -113,7 +113,10 @@ export default function UpdatePanel() {
           <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
             <div>
               <p className="text-[13px] font-semibold text-slate-100">服务更新</p>
-              <p className="text-[11px] text-slate-400">源码有变化就自动拉取并重建</p>
+              <p className="text-[11px] text-slate-400">
+                {status.autoUpdate ? "源码更新后自动拉取并重建" : "自动更新已关闭，可手动检查"}
+                {status.restartOnUpdate ? " · 平台接管重启" : " · 更新后需通过平台重启"}
+              </p>
             </div>
             <button
               type="button"

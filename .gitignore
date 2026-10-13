@@ -2,7 +2,10 @@ node_modules/
 .next/
 next-env.d.ts
 .env
+.env.*
+!.env.example
 .deploy/
+package-lock.json
 *.log
 .DS_Store
 tsconfig.tsbuildinfo
