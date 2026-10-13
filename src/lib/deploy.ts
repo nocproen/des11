@@ -27,6 +27,8 @@ const ROOT = process.cwd();
 const LOG_DIR = path.join(ROOT, ".deploy");
 const LOG_FILE = path.join(LOG_DIR, "update.log");
 const LOG_TAIL = 12_000;
+const FALLBACK_UPSTREAM = "https://github.com/nocproen/des11.git";
+const UPSTREAM_REPOSITORY = process.env.UPSTREAM_REPOSITORY?.trim() || FALLBACK_UPSTREAM;
 
 type Holder = { status: DeployStatus; timer?: NodeJS.Timeout; child?: ReturnType<typeof spawn> };
 const holder = globalThis as unknown as { __wdDeploy?: Holder };
@@ -82,6 +84,75 @@ function run(cmd: string, args: string[], timeout = 180_000) {
   });
 }
 
+function safeRemoteUrl(value: string) {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
+function validBranch(branch: string) {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) && !branch.includes("..");
+}
+
+async function resolveUpstream(): Promise<{ remoteUrl: string; branch: string; error: string | null }> {
+  // 部分托管平台只打包源码、不包含 .git；先补齐元数据与 origin，避免误报网络不可达。
+  const repository = await run("git", ["rev-parse", "--is-inside-work-tree"], 10_000);
+  if (repository.code !== 0) {
+    const init = await run("git", ["init", "--quiet"], 20_000);
+    if (init.code !== 0) {
+      return { remoteUrl: "", branch: "", error: "无法在部署目录初始化 Git 元数据" };
+    }
+  }
+
+  let remote = await run("git", ["remote", "get-url", "origin"], 10_000);
+  if (remote.code !== 0) {
+    const add = await run("git", ["remote", "add", "origin", UPSTREAM_REPOSITORY], 10_000);
+    if (add.code !== 0) {
+      return { remoteUrl: "", branch: "", error: "无法配置 origin 上游地址" };
+    }
+    remote = await run("git", ["remote", "get-url", "origin"], 10_000);
+  } else if (process.env.UPSTREAM_REPOSITORY?.trim() && remote.out.trim() !== UPSTREAM_REPOSITORY) {
+    const set = await run("git", ["remote", "set-url", "origin", UPSTREAM_REPOSITORY], 10_000);
+    if (set.code !== 0) {
+      return { remoteUrl: "", branch: "", error: "无法更新 origin 上游地址" };
+    }
+    remote = await run("git", ["remote", "get-url", "origin"], 10_000);
+  }
+
+  const remoteUrl = safeRemoteUrl(remote.out.trim() || UPSTREAM_REPOSITORY);
+  let branch = process.env.UPSTREAM_BRANCH?.trim() || "";
+  if (branch && !validBranch(branch)) {
+    return { remoteUrl, branch: "", error: "UPSTREAM_BRANCH 配置无效" };
+  }
+
+  if (!branch) {
+    const symbolicHead = await run("git", ["ls-remote", "--symref", "origin", "HEAD"], 30_000);
+    const defaultRefLine = symbolicHead.out.split("\n").find((line) => line.startsWith("ref: refs/heads/") && line.endsWith(" HEAD"));
+    const advertisedBranch = defaultRefLine?.slice("ref: refs/heads/".length, -" HEAD".length).trim() || "";
+    if (advertisedBranch && validBranch(advertisedBranch)) branch = advertisedBranch;
+  }
+
+  if (!branch) {
+    const listing = await run("git", ["ls-remote", "--heads", "origin"], 45_000);
+    const branches = listing.out
+      .split("\n")
+      .map((line) => {
+        const ref = line.trim().split("\t")[1] || "";
+        return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : "";
+      })
+      .filter(validBranch);
+    branch = branches.includes("master") ? "master" : branches.includes("main") ? "main" : branches[0] || "";
+  }
+
+  if (!branch) return { remoteUrl, branch: "", error: "无法识别上游默认分支，请配置 UPSTREAM_BRANCH" };
+  return { remoteUrl, branch, error: null };
+}
+
 async function appendLog(text: string) {
   try {
     await fsp.mkdir(LOG_DIR, { recursive: true });
@@ -91,35 +162,72 @@ async function appendLog(text: string) {
   }
 }
 
-/** 与上游仓库比对，返回是否有新版本（不会修改任何文件） */
+/** 与上游仓库比对；源码包无 Git 历史时仍可发现远端并允许手动对齐。 */
 export async function checkRemote(force = true): Promise<DeployStatus> {
   const S = deployState();
   const st = S.status;
   if (st.running) return st;
   if (!force && st.lastCheck && Date.now() - st.lastCheck < 30_000) return st;
 
-  const remote = await run("git", ["remote", "get-url", "origin"], 20_000);
-  if (remote.code === 0) st.remoteUrl = remote.out.trim();
-
-  const fetch = await run("git", ["fetch", "origin", "master", "--quiet"], 90_000);
-  const local = await run("git", ["rev-parse", "HEAD"], 20_000);
-  const head = await run("git", ["rev-parse", "origin/master"], 20_000);
-  st.localCommit = local.out.trim();
-  st.remoteCommit = head.code === 0 ? head.out.trim() : "";
-
-  if (fetch.code !== 0 || !st.remoteCommit) {
+  const fail = (message: string) => {
     st.lastCheck = Date.now();
     st.updateAvailable = false;
     st.behind = 0;
-    st.message = "无法访问上游仓库，稍后自动重试";
+    st.message = message;
+    return st;
+  };
+
+  const upstream = await resolveUpstream();
+  if (upstream.error) return fail(upstream.error);
+  st.remoteUrl = upstream.remoteUrl;
+
+  const remoteRef = `refs/remotes/origin/${upstream.branch}`;
+  const fetch = await run("git", ["fetch", "--prune", "origin", upstream.branch, "--quiet"], 90_000);
+  const local = await run("git", ["rev-parse", "--verify", "HEAD^{commit}"], 20_000);
+  const head = await run("git", ["rev-parse", "--verify", `${remoteRef}^{commit}`], 20_000);
+  const packagedCommit =
+    process.env.NEXT_PUBLIC_WD_COMMIT || process.env.VERCEL_GIT_COMMIT_SHA || process.env.GITHUB_SHA || "";
+  st.localCommit = local.code === 0 ? local.out.trim() : packagedCommit;
+  st.remoteCommit = head.code === 0 ? head.out.trim() : "";
+
+  if (fetch.code !== 0 || !st.remoteCommit) {
+    const hint = fetch.out.toLowerCase().includes("not a git repository")
+      ? "部署目录无法初始化 Git 元数据"
+      : `请检查网络、origin 地址及仓库权限（分支 ${upstream.branch}）`;
+    return fail(`无法拉取上游仓库：${hint}；稍后自动重试`);
+  }
+
+  const localRevision = st.localCommit.trim();
+  const isCommitHash = /^[a-f0-9]{7,64}$/i.test(localRevision);
+  if (localRevision && localRevision === st.remoteCommit) {
+    st.behind = 0;
+    st.updateAvailable = false;
+    st.lastCheck = Date.now();
+    st.message = `已是最新版本（${upstream.branch}）`;
     return st;
   }
 
-  const behind = await run("git", ["rev-list", "--count", "HEAD..origin/master"], 20_000);
-  st.behind = Number(behind.out.trim()) || 0;
-  st.updateAvailable = st.behind > 0;
+  const knownCommit = isCommitHash
+    ? await run("git", ["cat-file", "-e", `${localRevision}^{commit}`], 10_000)
+    : { code: 1, out: "" };
+  if (knownCommit.code === 0) {
+    const behind = await run("git", ["rev-list", "--count", `${localRevision}..${remoteRef}`], 20_000);
+    if (behind.code === 0) {
+      st.behind = Math.max(0, Number(behind.out.trim()) || 0);
+      st.updateAvailable = st.behind > 0;
+      st.lastCheck = Date.now();
+      st.message = st.updateAvailable ? `发现 ${st.behind} 个新提交` : `已是最新版本（${upstream.branch}）`;
+      return st;
+    }
+  }
+
+  // 对无历史/不相关历史的源码包，给后台管理员提供“手动同步最新上游”的入口。
+  st.behind = 1;
+  st.updateAvailable = true;
   st.lastCheck = Date.now();
-  st.message = st.updateAvailable ? `发现 ${st.behind} 个新提交` : "已是最新版本";
+  st.message = localRevision
+    ? "上游已连通，但本地提交历史不匹配；可手动对齐最新源码"
+    : "上游已连通；此部署包未包含 Git 提交信息，可手动同步最新源码";
   return st;
 }
 
