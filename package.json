@@ -2,9 +2,9 @@
   "name": "nextjs-postgresql-template",
   "private": true,
   "scripts": {
-    "dev": "next dev --hostname 0.0.0.0 --port ${PORT:-3000}",
+    "dev": "next dev",
     "build": "next build",
-    "start": "bash scripts/start.sh",
+    "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit"
   },
@@ -25,7 +25,7 @@
     "ws": "^8.22.0"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "4.1.17",
+    "@tailwindcss/postcss": "^4.1.17",
     "@types/node": "22.19.15",
     "@types/pg": "8.18.0",
     "@types/react": "19.2.14",
