@@ -1,6 +1,5 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
-import UpdatePanel from "@/components/update-panel";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -19,7 +18,6 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     <html lang="zh-CN">
       <body className="overflow-hidden bg-slate-950 text-slate-100 antialiased">
         {children}
-        <UpdatePanel />
       </body>
     </html>
   );

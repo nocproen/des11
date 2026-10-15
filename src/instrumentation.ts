@@ -16,7 +16,5 @@ export async function register() {
     console.error("[deploy] 初始化桌面密码失败", e);
   }
 
-  // 服务更新巡检：GitHub 源码有变化就自动拉取并重建
-  const { startDeployWatcher } = await import("./lib/deploy");
-  startDeployWatcher();
+  // 自动更新模块已按部署要求移除：本实例不再跟踪上游仓库、不拉取源码、不自动重建。
 }
