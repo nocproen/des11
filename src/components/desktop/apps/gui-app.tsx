@@ -218,6 +218,9 @@ export function GuiApp({ win }: { win: Win }) {
   const { clip: sysClipState } = useSys();
   const [imeText, setImeText] = useState("");
   const imeRef = useRef<HTMLInputElement>(null);
+  // VNC 会话内部复制的文本：只缓存，不自动覆盖本机剪贴板（否则会冲掉用户本地复制的内容）
+  const [vncClip, setVncClip] = useState("");
+  const vncClipRef = useRef("");
   const focused = wm.focusedId === win.id;
   const winId = win.id;
   const isBrowser = win.app === "browser";
@@ -394,9 +397,14 @@ export function GuiApp({ win }: { win: Win }) {
         startProbe();
         releaseFrameWhenPainted();
       });
+      // VNC 内部复制时不再自动写回本机剪贴板：那会冲掉用户本地复制的内容。
+      // 改为缓存到 vncClip，用户点按钮或按 Ctrl+Shift+V 时才取用。
       r.addEventListener("clipboard", (e) => {
         const text = (e.detail as { text?: string } | undefined)?.text;
-        if (text) navigator.clipboard?.writeText(text).catch(() => {});
+        if (text) {
+          vncClipRef.current = text;
+          setVncClip(text);
+        }
       });
       r.addEventListener("disconnect", async () => {
         clearTimeout(connTimer);
@@ -585,6 +593,23 @@ export function GuiApp({ win }: { win: Win }) {
         ev.preventDefault();
         ev.stopPropagation();
         if (!ev.repeat) toggleRemoteIme(r, { ctrl: true, shift: true });
+        return;
+      }
+      // Ctrl+Shift+V：把 VNC 里复制的文本取回本机剪贴板（不自动覆盖本地剪贴板）
+      if (r && ev.code === "KeyV" && (ev.ctrlKey || ev.metaKey) && ev.shiftKey && !ev.altKey) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!ev.repeat) {
+          const text = vncClipRef.current;
+          if (text) {
+            navigator.clipboard?.writeText(text).then(
+              () => dlg.toast("已把 VNC 里复制的文本取回本机剪贴板"),
+              () => dlg.toast("取回失败：浏览器拒绝了剪贴板写入权限"),
+            );
+          } else {
+            dlg.toast("VNC 会话里还没有复制过文本");
+          }
+        }
         return;
       }
       if (!r || !(ev.ctrlKey || ev.metaKey) || ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== "v") return;
@@ -826,6 +851,21 @@ export function GuiApp({ win }: { win: Win }) {
     dlg.toast("已向当前 VNC 应用发送粘贴指令 (Ctrl+V)");
   };
 
+  // 把 VNC 会话里复制的文本取回本机剪贴板（用户主动触发，不自动覆盖）
+  const pullVncClip = async () => {
+    const text = vncClipRef.current || vncClip;
+    if (!text) {
+      dlg.toast("VNC 会话里还没有复制过文本");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      dlg.toast("已把 VNC 里复制的文本取回本机剪贴板");
+    } catch {
+      dlg.toast("取回失败：浏览器拒绝了剪贴板写入权限");
+    }
+  };
+
   const sendIme = () => {
     const r = rfbRef.current;
     if (!r || !imeText) return;
@@ -857,6 +897,21 @@ export function GuiApp({ win }: { win: Win }) {
             className="absolute bottom-3 right-25 z-10 grid h-9 min-w-9 place-items-center rounded-full bg-black/50 px-2.5 text-xs font-medium text-slate-200 shadow-lg backdrop-blur hover:bg-black/70"
           >
             📋{sysClipState?.paths.length ? " 粘贴" : ""}
+          </button>
+        )}
+
+        {phase === "running" && (
+          <button
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => void pullVncClip()}
+            title={
+              vncClip
+                ? "把 VNC 里复制的文本取回本机剪贴板（不再自动覆盖本地剪贴板）"
+                : "VNC 会话里复制的文本会缓存在这里，点我取回本机剪贴板"
+            }
+            className="absolute bottom-3 right-36 z-10 grid h-9 min-w-9 place-items-center rounded-full bg-black/50 px-2 text-sm font-medium text-slate-200 shadow-lg backdrop-blur hover:bg-black/70"
+          >
+            ⤵
           </button>
         )}
 
