@@ -58,7 +58,7 @@ const TILE_QUALITY = 80;
 // 关闭拥塞控制仅用于对比测试（等同旧版行为）
 const CC_DEFAULT = process.env.BROWSER_CC !== "off";
 
-function connection(ws: WebSocket, s: Session, CC: boolean, cookie: string | undefined) {
+function connection(ws: WebSocket, s: Session, CC: boolean, cookie: string | undefined, access: string | null) {
   const ac = new AbortController();
   let paused = false;
   let alive = true;
@@ -186,7 +186,7 @@ function connection(ws: WebSocket, s: Session, CC: boolean, cookie: string | und
   const probe = setInterval(sendPing, 2000);
   // 登录失效（密码到期 / 被强制下线 / 改了密码）时立即断开并关闭这个浏览器会话
   const authTimer = setInterval(() => {
-    void desktopAuthedHeader(cookie).then((ok) => {
+    void desktopAuthedHeader(cookie, access).then((ok) => {
       if (ok || !alive) return;
       void closeSession(s);
       try {
@@ -437,13 +437,14 @@ function attach(server: http.Server) {
     handleProtocols: (protocols) => (protocols.has("binary") ? "binary" : false),
   });
   const onUpgrade = async (req: http.IncomingMessage, socket: Duplex, head: Buffer) => {
-    // 终端与浏览器通道都必须已登录桌面
-    if (!(await desktopAuthedHeader(req.headers.cookie))) {
+    const url = new URL(req.url ?? "/", "http://x");
+    const access = url.searchParams.get("access");
+    // Cookie 和网页独有的会话标识均需有效，旧页面无法续用新 Cookie。
+    if (!(await desktopAuthedHeader(req.headers.cookie, access))) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
-    const url = new URL(req.url ?? "/", "http://x");
     if (url.pathname === TERM_PATH) return termUpgrade(wss, req, socket, head, url);
     if (url.pathname === GUI_PATH) return guiUpgrade(wss, req, socket, head, url);
     const s = getSession(url.searchParams.get("sid") ?? "");
@@ -455,7 +456,7 @@ function attach(server: http.Server) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       (socket as import("net").Socket).setNoDelay?.(true);
       touch(s);
-      connection(ws, s, CC_DEFAULT && url.searchParams.get("cc") !== "off", req.headers.cookie);
+      connection(ws, s, CC_DEFAULT && url.searchParams.get("cc") !== "off", req.headers.cookie, access);
     });
   };
 

@@ -257,7 +257,7 @@ export function termUpgrade(
 
     // 登录失效（密码到期 / 被强制下线 / 改了密码）：立即结束终端进程并断开
     const authTimer = setInterval(() => {
-      void desktopAuthedHeader(req.headers.cookie).then((ok) => {
+      void desktopAuthedHeader(req.headers.cookie, url.searchParams.get("access")).then((ok) => {
         if (ok) return;
         clearInterval(authTimer);
         void ready.then((s) => {

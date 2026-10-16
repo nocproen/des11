@@ -292,50 +292,68 @@ export async function checkDesktopPassword(pw: string) {
   return verifyPassword(pw, await getCfg("desk_hash", 0));
 }
 
-export async function createDesktopToken(remember: boolean) {
-  const age = remember ? DESKTOP_MAX_AGE : DESKTOP_SHORT_AGE;
-  const v = (await getCfg("desk_ver")) ?? "1";
-  const { expiresAt } = await getDesktopStatus();
-  let exp = Date.now() + age * 1000;
-  if (expiresAt) exp = Math.min(exp, expiresAt); // 会话不会比密码活得更久
+// 每次成功登录生成新的随机会话。活跃会话记录在 PostgreSQL 中，不依赖单个 Node 进程的内存。
+// 同一个浏览器的不同标签共享 Cookie，因此还要求每页自己的随机会话标识。
+export async function createDesktopToken(password: string) {
+  await ensureAuthTables();
+  const sessionId = crypto.randomBytes(24).toString("base64url");
+  const result = await db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(28411, 1)`);
+    const rows = await tx.select().from(authConfig).where(inArray(authConfig.key, ["desk_hash", "desk_ver", "desk_expires"]));
+    const config = new Map(rows.map((row) => [row.key, row.value]));
+    if (!(await verifyPassword(password, config.get("desk_hash")))) return null;
+    const passwordExpiry = Number(config.get("desk_expires") ?? 0);
+    if (passwordExpiry && passwordExpiry <= Date.now()) return null;
+    const expiry = Math.min(Date.now() + DESKTOP_SHORT_AGE * 1000, passwordExpiry || Infinity);
+    await tx.insert(authConfig).values({ key: "desk_active", value: sessionId })
+      .onConflictDoUpdate({ target: authConfig.key, set: { value: sessionId } });
+    return { version: config.get("desk_ver") ?? "1", expiry };
+  });
+  S.cache.delete("desk_active");
+  if (!result) return null;
   return {
-    token: await sign({ k: "d", exp, v }),
-    maxAge: remember ? Math.max(1, Math.floor((exp - Date.now()) / 1000)) : undefined,
+    token: await sign({ k: "d", exp: result.expiry, v: result.version, sid: sessionId }),
+    sessionId,
   };
 }
 
-export async function verifyDesktopToken(token?: string | null) {
-  const p = await unsign<{ k: string; exp: number; v: string }>(token);
-  if (!p || p.k !== "d") return false;
+export async function verifyDesktopToken(token?: string | null, sessionId?: string | null) {
+  if (!sessionId || sessionId.length > 128) return false;
+  const p = await unsign<{ k: string; exp: number; v: string; sid?: string }>(token);
+  if (!p || p.k !== "d" || p.sid !== sessionId) return false;
   const st = await getDesktopStatus();
-  if (!st.set || st.expired) return false; // 没有设置密码或密码已过期 = 桌面锁定
-  return p.v === ((await getCfg("desk_ver")) ?? "1");
+  if (!st.set || st.expired) return false;
+  return p.v === ((await getCfg("desk_ver", 0)) ?? "1") && p.sid === (await getCfg("desk_active", 0));
 }
 
-/** API 路由守卫：未登录返回 401 响应，已登录返回 null */
+function requestDesktopSession(req: Request) {
+  // 图片、音频、视频及下载链接无法添加自定义请求头，使用同源 URL 查询参数。
+  return req.headers.get("x-desktop-session") ?? new URL(req.url).searchParams.get("access");
+}
+
+/** API 路由守卫：Cookie + 此页面独有的会话标识必须同时匹配。 */
 export async function denyDesktop(req: Request): Promise<Response | null> {
   try {
-    if (await verifyDesktopToken(cookieValue(req.headers.get("cookie"), DESKTOP_COOKIE))) return null;
+    if (await verifyDesktopToken(cookieValue(req.headers.get("cookie"), DESKTOP_COOKIE), requestDesktopSession(req))) return null;
   } catch {
-    // 数据库异常时仍然拒绝，但不能说成"未登录"：网页收到 401 会整页刷新（并结束所有应用）。503 表示稍后重试
-    return Response.json({ error: "服务暂时不可用，请稍后重试" }, { status: 503 });
+    return Response.json({ error: "服务暂时不可用，请稍后重试" }, { status: 503, headers: { "Cache-Control": "no-store" } });
   }
-  return Response.json({ error: "未登录或登录已过期" }, { status: 401 });
+  return Response.json({ error: "其他设备已登录或登录已过期，请重新输入密码" }, { status: 401, headers: { "Cache-Control": "no-store" } });
 }
 
-/** WebSocket 升级请求的登录检查 */
-export async function desktopAuthedHeader(cookieHeader: string | undefined) {
+/** WebSocket 升级请求及定期续验均同时检查 Cookie 与原页面会话标识。 */
+export async function desktopAuthedHeader(cookieHeader: string | undefined, sessionId: string | null) {
   try {
-    return await verifyDesktopToken(cookieValue(cookieHeader, DESKTOP_COOKIE));
+    return await verifyDesktopToken(cookieValue(cookieHeader, DESKTOP_COOKIE), sessionId);
   } catch {
     return false;
   }
 }
 
-/** 同上，但数据库临时出错时返回 null（不能当作"已退出登录"，否则会误杀正在运行的应用） */
-export async function desktopAuthState(cookieHeader: string | undefined): Promise<boolean | null> {
+/** 与上面相同，但数据库暂时故障时不误杀仍在运行的进程。 */
+export async function desktopAuthState(cookieHeader: string | undefined, sessionId: string | null): Promise<boolean | null> {
   try {
-    return await verifyDesktopToken(cookieValue(cookieHeader, DESKTOP_COOKIE));
+    return await verifyDesktopToken(cookieValue(cookieHeader, DESKTOP_COOKIE), sessionId);
   } catch {
     return null;
   }
@@ -354,20 +372,28 @@ export async function findAdminByName(name: string) {
 }
 
 export async function createAdminToken(u: AdminUser) {
-  return sign({ k: "a", exp: Date.now() + ADMIN_MAX_AGE * 1000, uid: u.id, fp: fp(u.passwordHash) });
+  const sessionId = crypto.randomBytes(24).toString("base64url");
+  const key = `admin_active_${u.id}`;
+  await setCfg(key, sessionId);
+  return {
+    token: await sign({ k: "a", exp: Date.now() + ADMIN_MAX_AGE * 1000, uid: u.id, fp: fp(u.passwordHash), sid: sessionId }),
+    sessionId,
+  };
 }
 
-export async function verifyAdminToken(token?: string | null): Promise<AdminUser | null> {
-  const p = await unsign<{ k: string; exp: number; uid: number; fp: string }>(token);
-  if (!p || p.k !== "a") return null;
+export async function verifyAdminToken(token?: string | null, sessionId?: string | null): Promise<AdminUser | null> {
+  if (!sessionId || sessionId.length > 128) return null;
+  const p = await unsign<{ k: string; exp: number; uid: number; fp: string; sid?: string }>(token);
+  if (!p || p.k !== "a" || p.sid !== sessionId) return null;
   await ensureAuthTables();
   const [u] = await db.select().from(adminUsers).where(eq(adminUsers.id, p.uid));
-  return u && fp(u.passwordHash) === p.fp ? u : null;
+  if (!u || fp(u.passwordHash) !== p.fp) return null;
+  return (await getCfg(`admin_active_${u.id}`, 0)) === p.sid ? u : null;
 }
 
 export async function requireAdmin(req: Request) {
   try {
-    return await verifyAdminToken(cookieValue(req.headers.get("cookie"), ADMIN_COOKIE));
+    return await verifyAdminToken(cookieValue(req.headers.get("cookie"), ADMIN_COOKIE), req.headers.get("x-admin-session"));
   } catch {
     return null;
   }

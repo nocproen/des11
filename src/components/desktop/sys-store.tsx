@@ -10,6 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { useDialogs } from "./dialogs";
+import { withDesktopAccess } from "./client-session";
 
 export type SysEntry = {
   name: string;
@@ -122,7 +123,7 @@ export const sysApi = {
 };
 
 export const rawUrl = (p: string, download = false) =>
-  `/api/sys/raw?path=${q(p)}${download ? "&download=1" : ""}`;
+  withDesktopAccess(`/api/sys/raw?path=${q(p)}${download ? "&download=1" : ""}`);
 
 export function baseName(p: string) {
   if (p === "/") return "/";
@@ -326,4 +327,4 @@ export function useSysOps() {
 }
 
 // 应用图标（按图标名或绝对路径，由服务器在系统图标主题里查找）
-export const guiIconUrl = (name: string) => `/api/gui/icon?name=${encodeURIComponent(name)}`;
+export const guiIconUrl = (name: string) => withDesktopAccess(`/api/gui/icon?name=${encodeURIComponent(name)}`);

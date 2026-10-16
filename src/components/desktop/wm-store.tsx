@@ -90,11 +90,15 @@ export type Win = {
   desktopFile?: string;
   iconUrl?: string;
   pendingUrl?: string;
+  browserTabs?: string[];
+  browserActiveIndex?: number;
+  guiSid?: string;
 };
 
 type State = { wins: Win[]; z: number; seq: number };
 
 type Action =
+  | { type: "hydrate"; state: State }
   | { type: "open"; win: Omit<Win, "id" | "z"> }
   | { type: "focus"; id: string }
   | { type: "close"; id: string }
@@ -107,6 +111,8 @@ type Action =
 
 function reducer(s: State, a: Action): State {
   switch (a.type) {
+    case "hydrate":
+      return a.state;
     case "open": {
       const seq = s.seq + 1;
       const z = s.z + 1;
@@ -173,38 +179,135 @@ export function useWm() {
   return v;
 }
 
-const SAVED_WINS = "wd.guiWins";
-type SavedWin = Pick<Win, "app" | "x" | "y" | "w" | "h" | "maximized" | "cmd" | "desktopFile" | "title" | "iconUrl">;
+type WorkspaceResponse = { snapshot: State; version: number };
+
+// 只持久化 UI 视图。文件、壁纸与真实系统目录由仓库原有 API 分别保存。
+function snapshotOf(s: State): State {
+  return {
+    wins: s.wins.map((w) => ({ ...w, pendingUrl: undefined })),
+    z: s.z,
+    seq: s.seq,
+  };
+}
 
 export function WmProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, { wins: [], z: 10, seq: 0 });
   const [isMobile, setIsMobile] = useState(false);
-  const restored = useRef(false);
+  const [ready, setReady] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const initialized = useRef(false);
+  const version = useRef(0);
+  const pending = useRef<State | null>(null);
+  const sending = useRef(false);
+  const latest = useRef(state);
+  const lastSerialized = useRef("");
+  latest.current = state;
 
-  // 网页刷新后（包括部署新版本后的自动刷新），把之前开着的图形应用窗口重新打开
-  useEffect(() => {
+  const flush = useCallback(async () => {
+    if (sending.current || !pending.current) return;
+    sending.current = true;
+    let working: State | null = null;
     try {
-      const saved = JSON.parse(localStorage.getItem(SAVED_WINS) ?? "[]") as SavedWin[];
-      for (const s of Array.isArray(saved) ? saved.slice(0, 4) : []) {
-        if (s.app !== "gui" || (!s.cmd && !s.desktopFile)) continue;
-        dispatch({ type: "open", win: { ...s, minimized: false, maximized: !!s.maximized, path: undefined } });
+      while (pending.current) {
+        working = pending.current;
+        pending.current = null;
+        const response = await fetch("/api/workspace", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ version: version.current, snapshot: working }),
+          cache: "no-store",
+        });
+        if (response.status === 401) return;
+        const data = (await response.json()) as { version?: number };
+        if (response.ok && typeof data.version === "number") {
+          version.current = data.version;
+        } else if (response.status === 409 && typeof data.version === "number") {
+          version.current = data.version;
+          pending.current ??= working;
+        } else {
+          throw new Error("桌面同步暂时不可用");
+        }
       }
     } catch {
-      /* 读不到就算了 */
+      if (working) pending.current ??= working;
+    } finally {
+      sending.current = false;
+      if (pending.current) window.setTimeout(() => void flush(), 1200);
     }
-    restored.current = true;
   }, []);
+
+  // 数据库未成功读取之前绝不渲染空桌面：临时故障时保留共享快照并自动重试。
   useEffect(() => {
-    if (!restored.current) return;
-    const keep: SavedWin[] = state.wins
-      .filter((w) => w.app === "gui" && (w.cmd || w.desktopFile))
-      .map(({ app, x, y, w, h, maximized, cmd, desktopFile, title, iconUrl }) => ({ app, x, y, w, h, maximized, cmd, desktopFile, title, iconUrl }));
-    try {
-      localStorage.setItem(SAVED_WINS, JSON.stringify(keep));
-    } catch {
-      /* ignore */
-    }
-  }, [state.wins]);
+    let active = true;
+    const load = async () => {
+      while (active) {
+        try {
+          const response = await fetch("/api/workspace", { cache: "no-store" });
+          if (!response.ok) throw new Error("无法加载桌面快照");
+          const data = (await response.json()) as WorkspaceResponse;
+          if (!active) return;
+          const rawWins = Array.isArray(data.snapshot?.wins) ? data.snapshot.wins : [];
+          const wins = rawWins.map((w) => ({
+            ...w,
+            w: Math.min(w.w, Math.max(180, window.innerWidth - 20)),
+            h: Math.min(w.h, Math.max(130, window.innerHeight - 70)),
+            x: Math.max(-w.w + 100, Math.min(w.x, window.innerWidth - 90)),
+            y: Math.max(0, Math.min(w.y, window.innerHeight - 100)),
+          }));
+          const hydrated: State = {
+            wins,
+            z: Math.max(data.snapshot.z || 10, 10, ...wins.map((w) => w.z)),
+            seq: Math.max(data.snapshot.seq || 0, 0, ...wins.map((w) => Number(w.id.slice(1)) || 0)),
+          };
+          version.current = data.version ?? 0;
+          lastSerialized.current = JSON.stringify(snapshotOf(hydrated));
+          dispatch({ type: "hydrate", state: hydrated });
+          initialized.current = true;
+          setReady(true);
+          return;
+        } catch {
+          if (!active) return;
+          setLoadError(true);
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+      }
+    };
+    void load();
+    return () => { active = false; };
+  }, []);
+
+  // 拖拽/缩放节流并顺序保存，避免较慢请求覆盖较新的窗口状态。
+  useEffect(() => {
+    if (!ready || !initialized.current) return;
+    const snapshot = snapshotOf(state);
+    const serialized = JSON.stringify(snapshot);
+    if (serialized === lastSerialized.current) return;
+    lastSerialized.current = serialized;
+    pending.current = snapshot;
+    const timer = window.setTimeout(() => void flush(), 180);
+    return () => window.clearTimeout(timer);
+  }, [state, ready, flush]);
+
+  useEffect(() => {
+    const saveAtExit = () => {
+      if (!initialized.current) return;
+      // keepalive 在关闭网页时继续发送；当前页面的会话头由 client-session 附加。
+      void fetch("/api/workspace", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: version.current, snapshot: snapshotOf(latest.current), force: true }),
+        keepalive: true,
+        cache: "no-store",
+      }).catch(() => {});
+    };
+    const onVisibility = () => { if (document.visibilityState === "hidden") saveAtExit(); };
+    window.addEventListener("pagehide", saveAtExit);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", saveAtExit);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
 
   useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768);
@@ -305,5 +408,5 @@ export function WmProvider({ children }: { children: ReactNode }) {
     [state.wins, focusedId, isMobile, open, toggleApp],
   );
 
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+  return <Ctx.Provider value={value}>{ready ? children : <div className="fixed inset-0 grid place-items-center bg-slate-950 text-sm text-sky-300">{loadError ? "连接数据库中断，正在重试同步桌面…" : "正在同步桌面屏幕…"}</div>}</Ctx.Provider>;
 }

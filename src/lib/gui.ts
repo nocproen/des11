@@ -74,7 +74,7 @@ const MAX_SESSIONS = 4;
 // 没有任何网页连着时，应用多保留多久（网页端会在这段时间内自动重连）。
 // 所有"空闲"计时都用单调时钟：本机会被平台整机冻结（可达数小时），恢复时墙钟（Date.now）会一次跳过去，
 // 但单调时钟不走，冻结的时间不该算作"没人连"。
-const IDLE_MS = 30 * 60_000;
+const IDLE_MS = 2 * 60 * 60_000;
 const mono = () => performance.now();
 const stamp = () => new Date().toISOString();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -205,6 +205,7 @@ const BROWSER_FLAGS = [
   "--disable-features=Translate,MediaRouter",
   "--disable-component-update",
   "--hide-crash-restore-bubble",
+  "--restore-last-session",
   "--force-device-scale-factor=1",
   "--lang=zh-CN",
 ].join(" ");
@@ -649,6 +650,7 @@ export type GuiOpts = {
   h?: number;
   preset?: string;
   url?: string;
+  sidHint?: string;
 };
 
 export async function createGui(o: GuiOpts): Promise<{ g: Gui; reused: boolean }> {
@@ -657,13 +659,11 @@ export async function createGui(o: GuiOpts): Promise<{ g: Gui; reused: boolean }
     // 浏览器只开一个：已经在运行就直接复用（刷新页面后能接回原来的标签页），并把网址交给它
     const existing = [...G.sessions.values()].find((x) => x.preset === "browser" && x.state !== "exited" && x.state !== "failed");
     if (existing) {
-      if (o.url) await openUrlIn(existing, o.url);
+      // 从共享桌面快照重连时保持原有标签页和当前画面，不重复打开旧 URL。
+      if (o.url && !o.sidHint) await openUrlIn(existing, o.url);
       existing.lastSeen = mono();
       return { g: existing, reused: true };
     }
-  }
-  if ([...G.sessions.values()].filter((g) => g.state !== "exited" && g.state !== "failed").length >= MAX_SESSIONS) {
-    throw new Error("图形应用窗口过多，请先关闭一个");
   }
   await cleanOrphans();
   let exec = (o.exec ?? "").trim();
@@ -688,6 +688,14 @@ export async function createGui(o: GuiOpts): Promise<{ g: Gui; reused: boolean }
   }
   if (!exec || exec.length > 4000 || /\0/.test(exec)) throw new Error("命令无效");
   if (!path.isAbsolute(cwd)) cwd = HOME;
+  const previous = o.sidHint ? G.sessions.get(o.sidHint) : undefined;
+  if (previous && previous.exec === exec && !previous.stopped && previous.state !== "exited" && previous.state !== "failed") {
+    previous.lastSeen = mono();
+    return { g: previous, reused: true };
+  }
+  if ([...G.sessions.values()].filter((g) => g.state !== "exited" && g.state !== "failed").length >= MAX_SESSIONS) {
+    throw new Error("图形应用窗口过多，请先关闭一个");
+  }
   // 同一个程序已经有一个没人连接的会话（比如刷新页面后残留）：先替换掉它，避免单实例程序拒绝新实例
   let replaced = false;
   for (const old of [...G.sessions.values()]) {
@@ -836,18 +844,17 @@ export function guiUpgrade(wss: WebSocketServer, req: http.IncomingMessage, sock
 
     // 登录失效（密码到期 / 强制下线）时立即断开并结束这个应用
     const authTimer = setInterval(() => {
-      void desktopAuthState(req.headers.cookie).then((ok) => {
+      void desktopAuthState(req.headers.cookie, url.searchParams.get("access")).then((ok) => {
         if (ok !== false || gone) return;
-        stopGui(g.id, "auth-expired");
+        // 只断开旧网页，不结束正在运行的图形进程；新页面可接回同一画面。
         try {
           ws.close(4001, "auth");
         } catch {
           /* ignore */
         }
       });
-      // 每 5 秒查一次数据库太密集：每个打开的窗口都是一条独立连接，几个窗口就是持续的数据库压力，
-      // 事件循环被占住时画面转发就会出现肉眼可见的顿挫。30 秒足够及时地踢掉失效会话。
-    }, 30_000);
+      // 每 5 秒校验一次，旧页面被接管后无法继续操控 VNC。
+    }, 5000);
 
     // 发送积压控制。
     // 原来的阈值是「积压到 4MB 才暂停」：在一条 2Mbps 的链路上，4MB 意味着排着 16 秒的陈旧画面，

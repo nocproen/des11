@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDialogs } from "../dialogs";
 import { useWm, type Win } from "../wm-store";
+import { withDesktopAccess } from "../client-session";
 
 type TabInfo = {
   id: number;
@@ -293,7 +294,7 @@ export function BrowserApp({ win }: { win: Win }) {
         let ws: WebSocket;
         try {
           ws = new WebSocket(
-            `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/browser/ws?sid=${id}${localStorage.getItem("wdCC") === "off" ? "&cc=off" : ""}`,
+            withDesktopAccess(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/browser/ws?sid=${id}${localStorage.getItem("wdCC") === "off" ? "&cc=off" : ""}`),
           );
         } catch {
           return done(false);
@@ -440,7 +441,7 @@ export function BrowserApp({ win }: { win: Win }) {
         const res = await fetch("/api/browser", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ w, h, url: initialUrl }),
+          body: JSON.stringify({ w, h, url: initialUrl, urls: win.browserTabs, activeIndex: win.browserActiveIndex }),
         });
         const d = (await res.json()) as { sid?: string; error?: string };
         if (!res.ok || !d.sid) throw new Error(d.error ?? "启动失败");
@@ -535,6 +536,18 @@ export function BrowserApp({ win }: { win: Win }) {
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
   }, [send, predictWheel]);
+
+  // 浏览器标签、选中项和网址同步到共享桌面快照，跨设备重开时恢复。
+  const tabsKey = meta?.tabs.map((t) => t.url).join("\u0000") ?? "";
+  useEffect(() => {
+    if (!meta?.tabs.length) return;
+    wm.patch(win.id, {
+      path: active?.url ?? "about:blank",
+      browserTabs: meta.tabs.map((t) => t.url),
+      browserActiveIndex: Math.max(0, meta.tabs.findIndex((t) => t.id === meta.active)),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabsKey, active?.url, meta?.active]);
 
   // 标题同步到窗口标题栏
   const activeTitle = active?.title || (isBlank ? "新标签页" : active?.url) || "浏览器";

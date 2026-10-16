@@ -4,6 +4,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSys } from "../sys-store";
 import { useWm, type Win } from "../wm-store";
+import { withDesktopAccess } from "../client-session";
 
 type Status = "connecting" | "open" | "reconnecting" | "exited" | "failed";
 
@@ -180,7 +181,7 @@ export function SysTermApp({ win }: { win: Win }) {
           `${proto}://${location.host}/api/term/ws?sid=${sid}&cols=${t.cols}&rows=${t.rows}` +
           `&cwd=${encodeURIComponent(startCwd.current)}` +
           (startCmd.current ? `&cmd=${encodeURIComponent(startCmd.current)}` : "");
-        const w = new WebSocket(url);
+        const w = new WebSocket(withDesktopAccess(url));
         w.binaryType = "arraybuffer";
         ws = w;
         let opened = false;

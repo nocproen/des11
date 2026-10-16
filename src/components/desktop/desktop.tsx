@@ -342,34 +342,9 @@ function Boot() {
   );
 }
 
-// 登录过期（接口返回 401）时自动刷新页面，回到锁屏页
-function AuthWatch() {
-  useEffect(() => {
-    const orig = window.fetch;
-    let fired = false;
-    window.fetch = async (...args: Parameters<typeof fetch>) => {
-      const res = await orig(...args);
-      if (res.status === 401 && !fired) {
-        const a = args[0];
-        const url = typeof a === "string" ? a : a instanceof URL ? a.href : a.url;
-        if (url.includes("/api/") && !url.includes("/api/auth/") && !url.includes("/api/ops/")) {
-          fired = true;
-          window.location.reload();
-        }
-      }
-      return res;
-    };
-    return () => {
-      window.fetch = orig;
-    };
-  }, []);
-  return null;
-}
-
 export default function Desktop() {
   return (
     <DialogProvider>
-      <AuthWatch />
       <FsProvider>
         <SysProvider>
           <WmProvider>

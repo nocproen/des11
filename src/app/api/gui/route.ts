@@ -17,6 +17,7 @@ export async function POST(req: Request) {
     h?: unknown;
     preset?: unknown;
     url?: unknown;
+    sidHint?: unknown;
   } | null;
   if (!b) return Response.json({ error: "请求无效" }, { status: 400 });
   const str = (v: unknown) => (typeof v === "string" ? v : undefined);
@@ -26,6 +27,7 @@ export async function POST(req: Request) {
     const { g, reused } = await createGui({
       preset,
       url: str(b.url),
+      sidHint: str(b.sidHint),
       exec: str(b.exec),
       desktopFile: str(b.desktopFile),
       cwd: str(b.cwd),

@@ -444,8 +444,7 @@ async function onPopup(page: Page) {
   await adopt(owner, page, true);
 }
 
-function navigate(s: Session, raw: string) {
-  const tab = activeTab(s);
+function navigate(s: Session, raw: string, tab = activeTab(s)) {
   if (!tab) return;
   let url = raw.trim();
   if (url !== "about:blank") {
@@ -469,7 +468,7 @@ function navigate(s: Session, raw: string) {
   });
 }
 
-export async function createSession(w: number, h: number, url?: string) {
+export async function createSession(w: number, h: number, url?: string, urls?: string[], activeIndex?: number) {
   if (G.sessions.size >= MAX_SESSIONS) throw new Error("浏览器窗口过多，请先关闭一个");
   await getCtx();
   ensureTimer();
@@ -497,8 +496,13 @@ export async function createSession(w: number, h: number, url?: string) {
   G.sessions.set(s.id, s);
   G.lastActive = s;
   try {
-    await adopt(s, await newPage(), true);
-    if (url) navigate(s, url);
+    const restored = urls?.length ? urls.slice(0, 10) : [url || "about:blank"];
+    for (let i = 0; i < restored.length; i++) {
+      const tab = await adopt(s, await newPage(), i === 0);
+      if (restored[i] && restored[i] !== "about:blank") navigate(s, restored[i], tab);
+    }
+    const chosen = Number.isInteger(activeIndex) ? Math.max(0, Math.min(restored.length - 1, activeIndex!)) : Math.max(0, restored.indexOf(url ?? ""));
+    if (chosen > 0 && s.tabs[chosen]) await activateTab(s, s.tabs[chosen].id);
   } catch (e) {
     await closeSession(s);
     throw e;

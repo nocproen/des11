@@ -2,6 +2,7 @@
 
 import type { DragEvent } from "react";
 import type { SysEntry } from "./sys-store";
+import { withDesktopAccess } from "./client-session";
 
 // 把服务器上的文件"给到"Windows：拖出去、下载、复制图片。
 // 网页没法把文件放进 Windows 剪贴板（浏览器只开放文字和 PNG 图片），所以"复制文件 → 桌面粘贴"做不到，
@@ -10,7 +11,7 @@ import type { SysEntry } from "./sys-store";
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
 export const isImage = (name: string) => IMAGE_EXT.test(name);
 
-export const downloadUrl = (p: string) => `/api/sys/download?path=${encodeURIComponent(p)}`;
+export const downloadUrl = (p: string) => withDesktopAccess(`/api/sys/download?path=${encodeURIComponent(p)}`);
 export const downloadName = (e: SysEntry) => (e.kind === "folder" ? `${e.name}.zip` : e.name);
 
 /** 在 dragstart 里调用：允许把这个文件 / 文件夹拖到 Windows（文件夹会变成 zip） */

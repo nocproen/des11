@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useDialogs } from "../dialogs";
 import { SYS_DRAG_KEY, baseName, readStoredSysClip, useSys } from "../sys-store";
 import { useWm, type Win } from "../wm-store";
+import { withDesktopAccess } from "../client-session";
 
 type Status = {
   state: "preparing" | "starting" | "running" | "exited" | "failed";
@@ -363,7 +364,7 @@ export function GuiApp({ win }: { win: Win }) {
       rfbCtor = RFB;
       host.innerHTML = "";
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const r = new RFB(host, `${proto}://${location.host}/api/gui/ws?sid=${sid}`, { shared: true });
+      const r = new RFB(host, withDesktopAccess(`${proto}://${location.host}/api/gui/ws?sid=${sid}`), { shared: true });
       const screen = host.firstElementChild as HTMLElement | null; // noVNC 的画面容器（里面是画布）
       rfb = r;
       rfbRef.current = r;
@@ -633,10 +634,10 @@ export function GuiApp({ win }: { win: Win }) {
     host.addEventListener("keyup", onKeyUp, true);
     host.addEventListener("pointerdown", onPointer, true);
 
-    // 刷新 / 关闭页面时结束应用，不留孤儿进程。浏览器例外：保留会话，刷新后能接回原来的标签页（空闲 90 秒后自动回收）
+    // 关页不结束图形程序：重新登录后复用相同 VNC 会话和画面。
+    let pageLeaving = false;
     const onHide = (ev: PageTransitionEvent) => {
-      if (ev.persisted) return; // 只是进入后退/前进缓存，页面还会回来
-      if (sid && !isBrowser) void fetch(`/api/gui/${sid}`, { method: "DELETE", keepalive: true }).catch(() => {});
+      if (!ev.persisted) pageLeaving = true;
     };
     window.addEventListener("pagehide", onHide);
 
@@ -652,10 +653,11 @@ export function GuiApp({ win }: { win: Win }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(
             isBrowser
-              ? { preset: "browser", url: init.path, w: Math.round(box.width) || 1024, h: Math.round(box.height) || 640 }
+              ? { preset: "browser", url: init.path, sidHint: win.guiSid, w: Math.round(box.width) || 1024, h: Math.round(box.height) || 640 }
               : {
                   exec: cmd,
                   desktopFile,
+                  sidHint: win.guiSid,
                   cwd: init.path,
                   name: init.title,
                   w: Math.round(box.width) || 1024,
@@ -667,6 +669,7 @@ export function GuiApp({ win }: { win: Win }) {
         if (!res.ok || !d.sid) return end(d.error ?? "启动失败");
         sid = d.sid;
         sidRef.current = sid;
+        wmRef.current.patch(winId, { guiSid: sid });
         if (dead) {
           if (!isBrowser) void fetch(`/api/gui/${sid}`, { method: "DELETE" });
           return;
@@ -710,7 +713,7 @@ export function GuiApp({ win }: { win: Win }) {
       rfb?.disconnect();
       rfbRef.current = null;
       sidRef.current = null;
-      if (sid) void fetch(`/api/gui/${sid}`, { method: "DELETE", keepalive: true }).catch(() => {});
+      if (sid && !pageLeaving) void fetch(`/api/gui/${sid}`, { method: "DELETE", keepalive: true }).catch(() => {});
       host.innerHTML = "";
       dropFrame();
     };

@@ -2,6 +2,7 @@ import {
   type AnyPgColumn,
   boolean,
   integer,
+  jsonb,
   pgTable,
   serial,
   text,
@@ -41,4 +42,13 @@ export const adminUsers = pgTable("admin_users", {
   passwordHash: text("password_hash").notNull(),
   mustChange: boolean("must_change").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// 全体桌面用户共用的一份屏幕快照：窗口、层级、大小、最小化状态等。
+// 版本号用于防止较慢的旧请求覆盖较新的桌面画面。
+export const desktopWorkspace = pgTable("desktop_workspace", {
+  id: integer("id").primaryKey(),
+  snapshot: jsonb("snapshot").notNull(),
+  version: integer("version").notNull().default(1),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });

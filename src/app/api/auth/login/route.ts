@@ -1,6 +1,5 @@
 import {
   DESKTOP_COOKIE,
-  checkDesktopPassword,
   clientIp,
   createDesktopToken,
   getDesktopStatus,
@@ -39,20 +38,20 @@ export async function POST(req: Request) {
     return Response.json({ error: "访问密码已过期，请联系管理员重新设置或续期", expired: true }, { status: 403 });
   }
 
-  if (!(await checkDesktopPassword(b.password))) {
+  const session = await createDesktopToken(b.password);
+  if (!session) {
     recordFailure("desk", ip);
     await sleep(500);
     const left = remainingAttempts("desk", ip);
     return Response.json(
       { error: left > 0 ? `密码不正确（还可尝试 ${left} 次）` : "尝试次数过多，已被临时锁定 10 分钟" },
-      { status: 401 },
+      { status: 401, headers: { "Cache-Control": "no-store" } },
     );
   }
 
   recordSuccess("desk", ip);
-  const { token, maxAge } = await createDesktopToken(b.remember !== false);
   return Response.json(
-    { ok: true },
-    { headers: { "Set-Cookie": setCookieHeader(DESKTOP_COOKIE, token, req, maxAge), "Cache-Control": "no-store" } },
+    { ok: true, sessionId: session.sessionId },
+    { headers: { "Set-Cookie": setCookieHeader(DESKTOP_COOKIE, session.token, req), "Cache-Control": "no-store" } },
   );
 }

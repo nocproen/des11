@@ -66,13 +66,14 @@ async function handle(req: Request, ctx: Ctx, method: "GET" | "POST") {
       return json({ error: left > 0 ? `账号或密码不正确（还可尝试 ${left} 次）` : "尝试次数过多，已被临时锁定 10 分钟" }, 401);
     }
     recordSuccess("admin", ip);
-    const token = await createAdminToken(user);
-    return json({ ok: true, mustChange: user.mustChange }, 200, {
-      "Set-Cookie": setCookieHeader(ADMIN_COOKIE, token, req, ADMIN_MAX_AGE),
+    const session = await createAdminToken(user);
+    return json({ ok: true, mustChange: user.mustChange, sessionId: session.sessionId }, 200, {
+      "Set-Cookie": setCookieHeader(ADMIN_COOKIE, session.token, req, ADMIN_MAX_AGE),
     });
   }
 
   if (action === "logout" && method === "POST") {
+    if (!(await requireAdmin(req))) return json({ error: "会话已经失效" }, 401);
     return json({ ok: true }, 200, { "Set-Cookie": clearCookieHeader(ADMIN_COOKIE, req) });
   }
 
@@ -116,9 +117,9 @@ async function handle(req: Request, ctx: Ctx, method: "GET" | "POST") {
     if (!patch.username && !patch.password) return json({ error: "没有需要修改的内容" }, 400);
     const updated = await updateAdmin(admin.id, patch);
     // 密码变了，旧令牌作废；给当前浏览器签发新令牌
-    const token = await createAdminToken(updated);
-    return json({ ok: true, username: updated.username }, 200, {
-      "Set-Cookie": setCookieHeader(ADMIN_COOKIE, token, req, ADMIN_MAX_AGE),
+    const session = await createAdminToken(updated);
+    return json({ ok: true, username: updated.username, sessionId: session.sessionId }, 200, {
+      "Set-Cookie": setCookieHeader(ADMIN_COOKIE, session.token, req, ADMIN_MAX_AGE),
     });
   }
 

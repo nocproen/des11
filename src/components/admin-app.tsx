@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 type State = {
   username: string;
@@ -23,22 +23,29 @@ const input =
 const btn = "rounded-lg px-4 py-2 text-sm font-medium transition disabled:opacity-40";
 
 export function AdminApp({ slug }: { slug: string }) {
+  const [state, setState] = useState<State | null>(null);
+  const [phase, setPhase] = useState<"login" | "panel">("login");
+  const sessionRef = useRef<string | null>(null);
   const api = useCallback(
     async (action: string, body?: object) => {
       const r = await fetch(`/api/ops/${slug}/${action}`, {
         method: body ? "POST" : "GET",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(sessionRef.current ? { "X-Admin-Session": sessionRef.current } : {}) },
         body: body ? JSON.stringify(body) : undefined,
         cache: "no-store",
       });
       const d = (await r.json().catch(() => ({}))) as Record<string, unknown> & { error?: string };
+      if (r.ok && typeof d.sessionId === "string") sessionRef.current = d.sessionId;
+      if (r.status === 401 && action !== "login") {
+        sessionRef.current = null;
+        setState(null);
+        setPhase("login");
+      }
+      if (r.ok && action === "logout") sessionRef.current = null;
       return { ok: r.ok, status: r.status, data: d };
     },
     [slug],
   );
-
-  const [state, setState] = useState<State | null>(null);
-  const [phase, setPhase] = useState<"loading" | "login" | "panel">("loading");
 
   const load = useCallback(async () => {
     const r = await api("state");
@@ -50,18 +57,13 @@ export function AdminApp({ slug }: { slug: string }) {
   }, [api]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load();
-  }, [load]);
-
-  useEffect(() => {
     if (phase !== "panel") return;
     const refresh = () => {
       if (document.visibilityState === "visible") void load();
     };
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", refresh);
-    const timer = window.setInterval(refresh, 30_000);
+    const timer = window.setInterval(refresh, 2500);
     return () => {
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", refresh);
@@ -94,7 +96,6 @@ export function AdminApp({ slug }: { slug: string }) {
           )}
         </header>
 
-        {phase === "loading" && <div className="py-20 text-center text-sm text-slate-500">加载中…</div>}
         {phase === "login" && <Login api={api} onDone={load} />}
         {phase === "panel" && state && <Panel state={state} api={api} reload={load} />}
       </div>
@@ -126,6 +127,7 @@ function Login({ api, onDone }: { api: Api; onDone: () => void }) {
       }}
     >
       <h2 className="text-base font-semibold">管理员登录</h2>
+      <p className="text-xs text-slate-400">每次打开网页需输入密码；新登录会让旧后台会话强制下线。</p>
       <input
         className={input}
         value={u}
