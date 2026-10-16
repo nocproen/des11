@@ -12,8 +12,9 @@ export const DESKTOP_COOKIE = "wd_session";
 export const ADMIN_COOKIE = "wd_admin";
 // 后台路径：默认值不常见，可用环境变量 ADMIN_PATH 自定义
 export const ADMIN_SLUG = (process.env.ADMIN_PATH || "ops-7k2m9x4q").replace(/^\/+|\/+$/g, "");
+// 桌面会话时长：30 天。若后台设置了密码到期时间，则以到期时间为准（30天与密码到期取较早者）
 export const DESKTOP_MAX_AGE = 7 * 24 * 3600;
-export const DESKTOP_SHORT_AGE = 12 * 3600;
+export const DESKTOP_SHORT_AGE = 30 * 24 * 3600;
 export const ADMIN_MAX_AGE = 12 * 3600;
 
 export const DEFAULT_ADMIN_USER = process.env.ADMIN_USER || "admin";
@@ -304,7 +305,11 @@ export async function createDesktopToken(password: string) {
     if (!(await verifyPassword(password, config.get("desk_hash")))) return null;
     const passwordExpiry = Number(config.get("desk_expires") ?? 0);
     if (passwordExpiry && passwordExpiry <= Date.now()) return null;
-    const expiry = Math.min(Date.now() + DESKTOP_SHORT_AGE * 1000, passwordExpiry || Infinity);
+    // 修复：之前 token 只有 12 小时，无论是否有人登录都会过期被踢。
+    // 现在：若密码设置了到期时间，token 到期 = min(30天后, 密码到期)；若永久有效，则 token 30天有效。
+    // 保证：空闲时不会被踢，只有新登录（desk_active 改变）或改密码/到期才会踢。
+    const longExpiry = Date.now() + DESKTOP_SHORT_AGE * 1000;
+    const expiry = passwordExpiry ? Math.min(longExpiry, passwordExpiry) : longExpiry;
     await tx.insert(authConfig).values({ key: "desk_active", value: sessionId })
       .onConflictDoUpdate({ target: authConfig.key, set: { value: sessionId } });
     return { version: config.get("desk_ver") ?? "1", expiry };

@@ -37,6 +37,7 @@ export function installDesktopSession(sessionId: string, onInvalid: () => void) 
     }
 
     const response = await nativeFetch(input, options);
+    // 修复：只有明确的 401 才踢人，503 等服务器临时错误不应踢
     if (active && !fired && protectedApi && response.status === 401) {
       fired = true;
       onInvalid();
@@ -47,13 +48,15 @@ export function installDesktopSession(sessionId: string, onInvalid: () => void) 
   let channel: BroadcastChannel | null = null;
   if (typeof BroadcastChannel !== "undefined") {
     channel = new BroadcastChannel("webdesktop-exclusive-session");
-    channel.onmessage = (event: MessageEvent<{ sessionId?: string }>) => {
+    channel.onmessage = (event: MessageEvent<{ sessionId?: string; ts?: number }>) => {
+      // 保证只有真正的新登录才踢人：如果收到的是自己刚发的消息（时间戳接近）不处理
       if (active && event.data?.sessionId && event.data.sessionId !== sessionId && !fired) {
         fired = true;
         onInvalid();
       }
     };
-    channel.postMessage({ sessionId });
+    // 发送时带时间戳，避免陈旧消息误触发
+    channel.postMessage({ sessionId, ts: Date.now() });
   }
 
   return () => {

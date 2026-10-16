@@ -185,17 +185,20 @@ function connection(ws: WebSocket, s: Session, CC: boolean, cookie: string | und
   }, 15_000);
   const probe = setInterval(sendPing, 2000);
   // 登录失效（密码到期 / 被强制下线 / 改了密码）时立即断开并关闭这个浏览器会话
+  // 修复：数据库短暂故障返回 false 不应踢人，只有明确的 false（且能正常查询）才踢；引入 desktopAuthState 区分 null（故障）与 false（已踢）
   const authTimer = setInterval(() => {
-    void desktopAuthedHeader(cookie, access).then((ok) => {
-      if (ok || !alive) return;
-      void closeSession(s);
-      try {
-        ws.close(4001, "auth");
-      } catch {
-        /* ignore */
-      }
-    });
-  }, 5000);
+    void import("@/lib/auth").then(({ desktopAuthState }) =>
+      desktopAuthState(cookie, access).then((ok) => {
+        if (ok !== false || !alive) return;
+        void closeSession(s);
+        try {
+          ws.close(4001, "auth");
+        } catch {
+          /* ignore */
+        }
+      }),
+    );
+  }, 15000);
   const warm = [0, 120, 260].map((d) => setTimeout(sendPing, d));
 
   const statsTimer = setInterval(() => {

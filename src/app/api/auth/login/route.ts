@@ -1,5 +1,6 @@
 import {
   DESKTOP_COOKIE,
+  DESKTOP_SHORT_AGE,
   clientIp,
   createDesktopToken,
   getDesktopStatus,
@@ -52,6 +53,6 @@ export async function POST(req: Request) {
   recordSuccess("desk", ip);
   return Response.json(
     { ok: true, sessionId: session.sessionId },
-    { headers: { "Set-Cookie": setCookieHeader(DESKTOP_COOKIE, session.token, req), "Cache-Control": "no-store" } },
+    { headers: { "Set-Cookie": setCookieHeader(DESKTOP_COOKIE, session.token, req, DESKTOP_SHORT_AGE), "Cache-Control": "no-store" } },
   );
 }
