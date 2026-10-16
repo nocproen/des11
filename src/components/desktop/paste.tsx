@@ -16,7 +16,7 @@ import {
 import { accentColor } from "./defs";
 import { useDialogs } from "./dialogs";
 import { useFs } from "./fs-store";
-import { baseName, sysApi, useSys } from "./sys-store";
+import { baseName, sysApi, useSys, useSysOps } from "./sys-store";
 
 // 粘贴 / 拖入 Windows 里的文件和截图，写到服务器上的真实目录。
 //
@@ -153,6 +153,8 @@ type Progress = { dir: string; done: number; total: number; bytes: number; total
 type PasteApi = {
   /** 右键菜单"粘贴"：粘贴到 dir */
   paste: (dir: string) => void;
+  /** 从本地电脑粘贴 / 上传文件到 dir */
+  pasteLocal: (dir: string) => void;
   /** 让某个区域接收从 Windows 拖进来的文件 */
   fileDrop: (dir: string | null) => { onDragOver: (e: DragEvent) => void; onDrop: (e: DragEvent) => void };
 };
@@ -170,7 +172,8 @@ const hasFiles = (e: DragEvent) => e.dataTransfer.types.includes("Files");
 export function PasteProvider({ children }: { children: ReactNode }) {
   const dlg = useDialogs();
   const fs = useFs();
-  const { bump } = useSys();
+  const { bump, clip } = useSys();
+  const ops = useSysOps();
   const [progress, setProgress] = useState<Progress | null>(null);
   const [askDir, setAskDir] = useState<string | null>(null);
   const busy = useRef(false);
@@ -235,10 +238,9 @@ export function PasteProvider({ children }: { children: ReactNode }) {
     [run],
   );
 
-  const paste = useCallback(
+  const pasteLocal = useCallback(
     (dir: string) => {
       void (async () => {
-        // 1) 内存里的图片：直接读
         try {
           const items = await navigator.clipboard.read();
           const imgs: Item[] = [];
@@ -253,11 +255,38 @@ export function PasteProvider({ children }: { children: ReactNode }) {
         } catch {
           /* 没权限 / 剪贴板里不是图片：走下面的 Ctrl+V 窗口 */
         }
-        // 2) 资源管理器里复制的文件：只能靠 paste 事件拿到
         setAskDir(dir);
       })();
     },
     [enqueue],
+  );
+
+  const paste = useCallback(
+    (dir: string) => {
+      void (async () => {
+        // 1) 如果在模拟桌面 / 文件管理器里已经复制或剪切了文件/图片，直接粘贴到该目录
+        if (clip && clip.paths.length > 0) {
+          const ok = await ops.pasteFiles(dir, false);
+          if (ok) return;
+        }
+        // 2) 检查 VNC 会话内部是否刚复制了文件或图片
+        try {
+          const r = await fetch("/api/gui/clipboard?probe=1", { cache: "no-store" });
+          if (r.ok) {
+            const d = (await r.json()) as { clip?: { paths?: string[] } | null };
+            if (d.clip?.paths?.length) {
+              const ok = await ops.pasteFiles(dir, true);
+              if (ok) return;
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        // 3) 本地电脑剪贴板里的图片或文件
+        pasteLocal(dir);
+      })();
+    },
+    [clip, ops, pasteLocal],
   );
 
   const fileDrop = useCallback(
@@ -287,15 +316,21 @@ export function PasteProvider({ children }: { children: ReactNode }) {
       const dir = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>("[data-paste-dir]")?.dataset.pasteDir;
       if (!dir) return;
       const dt = e.clipboardData;
-      if (!dt || !Array.from(dt.types).includes("Files")) return;
-      e.preventDefault();
-      enqueue(dir, pickFrom(dt));
+      if (dt && Array.from(dt.types).includes("Files")) {
+        e.preventDefault();
+        enqueue(dir, pickFrom(dt));
+        return;
+      }
+      if (clip && clip.paths.length > 0) {
+        e.preventDefault();
+        void ops.pasteFiles(dir, false);
+      }
     };
     document.addEventListener("paste", onPaste);
     return () => document.removeEventListener("paste", onPaste);
-  }, [askDir, enqueue]);
+  }, [askDir, clip, enqueue, ops]);
 
-  const api = useMemo(() => ({ paste, fileDrop }), [paste, fileDrop]);
+  const api = useMemo(() => ({ paste, pasteLocal, fileDrop }), [paste, pasteLocal, fileDrop]);
 
   return (
     <Ctx.Provider value={api}>

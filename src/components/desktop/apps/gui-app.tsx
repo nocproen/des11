@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useDialogs } from "../dialogs";
-import { SYS_DRAG_KEY, baseName } from "../sys-store";
+import { SYS_DRAG_KEY, baseName, readStoredSysClip, useSys } from "../sys-store";
 import { useWm, type Win } from "../wm-store";
 
 type Status = {
@@ -214,6 +214,7 @@ export function GuiApp({ win }: { win: Win }) {
   const [ime, setIme] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const dlg = useDialogs();
+  const { clip: sysClipState } = useSys();
   const [imeText, setImeText] = useState("");
   const imeRef = useRef<HTMLInputElement>(null);
   const focused = wm.focusedId === win.id;
@@ -554,8 +555,24 @@ export function GuiApp({ win }: { win: Win }) {
       return !!res?.ok;
     };
 
+    // 本机复制的文件通过浏览器 paste 事件粘贴进 VNC
+    const onPaste = (ev: ClipboardEvent) => {
+      if (!sid) return;
+      const files = Array.from(ev.clipboardData?.files ?? []);
+      if (!files.length) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const f = files[0];
+      void fetch(`/api/gui/${sid}/clipboard?name=${encodeURIComponent(f.name)}&paste=1`, {
+        method: "POST",
+        headers: { "Content-Type": f.type || "application/octet-stream" },
+        body: f,
+      }).catch(() => {});
+    };
+    host.addEventListener("paste", onPaste, true);
+
     // Ctrl+Shift+Space：切换远程输入法（Ctrl+Space 本身常被本机 Windows 输入法占用）
-    // Ctrl+V：先把本机剪贴板（图片或文字）同步给远程，再发送粘贴按键
+    // Ctrl+V：优先把模拟桌面/文件管理器复制的文件或图片同步给远程 VNC 并触发粘贴，其次读取本机剪贴板图片或文字
     const onKey = (ev: KeyboardEvent) => {
       const r = rfb;
       if (ev.code === "ShiftLeft" || ev.code === "ShiftRight") {
@@ -570,7 +587,6 @@ export function GuiApp({ win }: { win: Win }) {
         return;
       }
       if (!r || !(ev.ctrlKey || ev.metaKey) || ev.shiftKey || ev.altKey || ev.key.toLowerCase() !== "v") return;
-      if (!navigator.clipboard?.readText) return;
       ev.preventDefault();
       ev.stopPropagation();
       const press = () => {
@@ -579,8 +595,18 @@ export function GuiApp({ win }: { win: Win }) {
         r.sendKey(0x76, "KeyV", false);
         r.sendKey(0xffe3, "ControlLeft", false);
       };
+      const storedClip = readStoredSysClip();
+      if (sid && storedClip && storedClip.paths.length > 0) {
+        void fetch(`/api/gui/${sid}/clipboard`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ paths: storedClip.paths, cut: storedClip.cut, triggerPaste: true }),
+        }).catch(() => press());
+        return;
+      }
       void pasteImage().then((done) => {
         if (done) return setTimeout(press, 50);
+        if (!navigator.clipboard?.readText) return press();
         navigator.clipboard.readText().then(
           (text) => {
             if (text) r.clipboardPasteFrom(text);
@@ -668,6 +694,7 @@ export function GuiApp({ win }: { win: Win }) {
       dead = true;
       clearTimeout(qTimer);
       host.removeEventListener("wheel", onWheel, true);
+      host.removeEventListener("paste", onPaste, true);
       host.removeEventListener("keydown", onKey, true);
       host.removeEventListener("keyup", onKeyUp, true);
       host.removeEventListener("pointerdown", onPointer, true);
@@ -689,12 +716,14 @@ export function GuiApp({ win }: { win: Win }) {
     };
   }, [runKey, winId, cmd, desktopFile, isBrowser]);
 
-  // 从网页桌面 / 文件管理器拖进来的服务器文件：在松手处点一下，再把文件路径作为文字粘贴进去
+  // 从网页桌面 / 文件管理器或本地电脑拖进来的文件/图片：设置多目标剪贴板并在松手处点击粘贴
   const dropProps = {
     onDragOver: (e: React.DragEvent) => {
-      if (phase !== "running" || !e.dataTransfer.types.includes(SYS_DRAG_KEY)) return;
+      const hasSys = e.dataTransfer.types.includes(SYS_DRAG_KEY);
+      const hasLocal = e.dataTransfer.types.includes("Files");
+      if (phase !== "running" || (!hasSys && !hasLocal)) return;
       e.preventDefault();
-      e.dataTransfer.dropEffect = "move"; // 桌面图标的 effectAllowed 是 move；文件本身不会被移动
+      e.dataTransfer.dropEffect = hasSys ? "move" : "copy";
       setDragOver(true);
     },
     onDragLeave: (e: React.DragEvent) => {
@@ -705,22 +734,93 @@ export function GuiApp({ win }: { win: Win }) {
       const file = e.dataTransfer.getData(SYS_DRAG_KEY);
       const sid = sidRef.current;
       const canvas = hostRef.current?.querySelector("canvas");
-      if (!file || !sid || !canvas) return;
-      e.preventDefault();
+      if (!sid || !canvas) return;
       const rect = canvas.getBoundingClientRect();
       const x = ((e.clientX - rect.left) * canvas.width) / Math.max(1, rect.width);
       const y = ((e.clientY - rect.top) * canvas.height) / Math.max(1, rect.height);
-      void fetch(`/api/gui/${sid}/drop`, {
+      if (file) {
+        e.preventDefault();
+        void fetch(`/api/gui/${sid}/drop`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: file, x, y }),
+        })
+          .then(async (r) => {
+            if (!r.ok) throw new Error(((await r.json().catch(() => ({}))) as { error?: string }).error ?? "拖入失败");
+            dlg.toast(`已将「${baseName(file)}」粘贴到当前应用`);
+            rfbRef.current?.focus();
+          })
+          .catch((err) => dlg.toast(`「${baseName(file)}」${err instanceof Error ? err.message : "拖入失败"}`));
+        return;
+      }
+      const localFiles = Array.from(e.dataTransfer.files ?? []);
+      if (localFiles.length > 0) {
+        e.preventDefault();
+        const lf = localFiles[0];
+        void fetch(
+          `/api/gui/${sid}/clipboard?name=${encodeURIComponent(lf.name)}&paste=1&x=${Math.round(x)}&y=${Math.round(y)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": lf.type || "application/octet-stream" },
+            body: lf,
+          },
+        )
+          .then(async (r) => {
+            if (!r.ok) throw new Error(((await r.json().catch(() => ({}))) as { error?: string }).error ?? "拖入失败");
+            dlg.toast(`已将「${lf.name}」粘贴到当前应用`);
+            rfbRef.current?.focus();
+          })
+          .catch((err) => dlg.toast(`「${lf.name}」${err instanceof Error ? err.message : "拖入失败"}`));
+      }
+    },
+  };
+
+  const quickPasteToVnc = async () => {
+    const sid = sidRef.current;
+    const r = rfbRef.current;
+    if (!sid || !r) return;
+    const stored = sysClipState ?? readStoredSysClip();
+    if (stored && stored.paths.length > 0) {
+      const res = await fetch(`/api/gui/${sid}/clipboard`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: file, x, y }),
-      })
-        .then(async (r) => {
-          if (!r.ok) throw new Error(((await r.json().catch(() => ({}))) as { error?: string }).error ?? "拖入失败");
-          rfbRef.current?.focus();
-        })
-        .catch((err) => dlg.toast(`「${baseName(file)}」${err instanceof Error ? err.message : "拖入失败"}`));
-    },
+        body: JSON.stringify({ paths: stored.paths, cut: stored.cut, triggerPaste: true }),
+      }).catch(() => null);
+      if (res?.ok) {
+        dlg.toast(`已将「${baseName(stored.paths[0])}」粘贴到当前 VNC 应用`);
+        r.focus();
+        return;
+      }
+    }
+    try {
+      if (navigator.clipboard?.read) {
+        for (const item of await navigator.clipboard.read()) {
+          const type = item.types.find((t) => t.startsWith("image/"));
+          if (type) {
+            const blob = await item.getType(type);
+            const res = await fetch(`/api/gui/${sid}/clipboard?paste=1`, {
+              method: "POST",
+              headers: { "Content-Type": blob.type },
+              body: blob,
+            }).catch(() => null);
+            if (res?.ok) {
+              dlg.toast("已将剪贴板图片粘贴到当前 VNC 应用");
+              r.focus();
+              return;
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    await fetch(`/api/gui/${sid}/clipboard`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ triggerPaste: true }),
+    }).catch(() => {});
+    r.focus();
+    dlg.toast("已向当前 VNC 应用发送粘贴指令 (Ctrl+V)");
   };
 
   const sendIme = () => {
@@ -738,8 +838,23 @@ export function GuiApp({ win }: { win: Win }) {
         <div ref={ghostRef} className="pointer-events-none absolute inset-0 z-10" hidden={!frozen} />
         {dragOver && (
           <div className="pointer-events-none absolute inset-0 z-30 grid place-items-end justify-center rounded border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/10 pb-6">
-            <div className="rounded-full bg-black/70 px-4 py-1.5 text-sm text-white shadow-lg">松开鼠标，把文件路径填进输入框</div>
+            <div className="rounded-full bg-black/70 px-4 py-1.5 text-sm text-white shadow-lg">松开鼠标，将文件或图片粘贴到当前应用</div>
           </div>
+        )}
+
+        {phase === "running" && (
+          <button
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => void quickPasteToVnc()}
+            title={
+              sysClipState?.paths.length
+                ? `粘贴已复制的「${baseName(sysClipState.paths[0])}」到当前 VNC 应用（或直接按 Ctrl+V）`
+                : "将桌面已复制的文件/图片或本机剪贴板粘贴到当前 VNC 应用（Ctrl+V）"
+            }
+            className="absolute bottom-3 right-25 z-10 grid h-9 min-w-9 place-items-center rounded-full bg-black/50 px-2.5 text-xs font-medium text-slate-200 shadow-lg backdrop-blur hover:bg-black/70"
+          >
+            📋{sysClipState?.paths.length ? " 粘贴" : ""}
+          </button>
         )}
 
         {phase === "running" && (

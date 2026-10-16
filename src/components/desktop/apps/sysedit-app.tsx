@@ -73,6 +73,14 @@ export function SysEditApp({ win }: { win: Win }) {
         </button>
       )}
       <span className="min-w-0 flex-1 truncate text-slate-400">{path}</span>
+      <button
+        type="button"
+        onClick={() => void ops.copy(path, false)}
+        className="rounded-md px-2 py-1 text-slate-300 hover:bg-white/10"
+        title="复制此文件/图片（可直接粘贴到 VNC 应用或文件夹）"
+      >
+        📋 复制文件{previewKind === "img" ? "/图片" : ""}
+      </button>
       <a
         href={rawUrl(path, true)}
         className="rounded-md px-2 py-1 text-slate-300 hover:bg-white/10"

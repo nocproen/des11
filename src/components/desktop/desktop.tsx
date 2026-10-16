@@ -12,6 +12,7 @@ import { allowDragOut, copyImage, downloadEntry, isImage } from "./export-file";
 import {
   SYS_DRAG_KEY,
   SysProvider,
+  baseName,
   guiIconUrl,
   useSys,
   useSysOps,
@@ -50,7 +51,7 @@ function Shell() {
   const ops = useSysOps();
   const paste = usePaste();
   const dlg = useDialogs();
-  const { info, desktopItems, bump } = useSys();
+  const { info, desktopItems, bump, clip } = useSys();
   const [startOpen, setStartOpen] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
 
@@ -112,6 +113,13 @@ function Shell() {
     else openEntry(i.entry);
   };
 
+  const copyEntryItem = (en: SysEntry, cut = false) => {
+    void ops.copy(en.path, cut);
+    if (!cut && isImage(en.name) && en.kind === "file") {
+      void copyImage(en.path).catch(() => {});
+    }
+  };
+
   const iconMenu = (e: React.MouseEvent, i: DesktopIcon) => {
     setSelected(i.key);
     if (i.kind === "entry") {
@@ -119,8 +127,10 @@ function Shell() {
       return menu.show(e, [
         { label: "打开", icon: "📂", onClick: () => openEntry(en) },
         ...entryExtraMenu(wm, en),
+        { label: "复制（可粘贴到 VNC / 文件夹）", icon: "📋", onClick: () => copyEntryItem(en, false) },
+        { label: "剪切", icon: "✂️", onClick: () => copyEntryItem(en, true) },
         ...(en.kind === "folder"
-          ? [{ label: "粘贴到此文件夹", icon: "📋", onClick: () => paste.paste(en.path) }]
+          ? [{ label: "粘贴到此文件夹", icon: "📥", onClick: () => paste.paste(en.path) }]
           : []),
         {
           label: "在终端中打开",
@@ -130,9 +140,18 @@ function Shell() {
         { label: "重命名", icon: "✏️", onClick: () => void ops.renameDialog(en.path) },
         { label: "下载到电脑", icon: "⬇️", onClick: () => downloadEntry(en) },
         ...(isImage(en.name) && en.kind === "file"
-          ? [{ label: "复制图片", icon: "🖼️", onClick: () => void copyImage(en.path).then(() => dlg.toast("图片已复制，可以在 Windows 里粘贴"), () => dlg.toast("复制失败，浏览器不允许访问剪贴板")) }]
+          ? [
+              {
+                label: "复制图片（同步 VNC 与本机）",
+                icon: "🖼️",
+                onClick: () => {
+                  void ops.copy(en.path, false);
+                  void copyImage(en.path).catch(() => {});
+                },
+              },
+            ]
           : []),
-        { label: "复制路径", icon: "📋", onClick: () => void copyText(en.path).then((ok) => dlg.toast(ok ? `已复制：${en.path}` : "复制失败，浏览器不允许访问剪贴板")) },
+        { label: "复制路径", icon: "🔗", onClick: () => void copyText(en.path).then((ok) => dlg.toast(ok ? `已复制：${en.path}` : "复制失败，浏览器不允许访问剪贴板")) },
         { divider: true },
         { label: "移到回收站", icon: "🗑️", danger: true, onClick: () => void ops.trash(en.path) },
       ]);
@@ -150,7 +169,15 @@ function Shell() {
     menu.show(e, [
       { label: "新建文件夹", icon: "📁", onClick: () => void ops.newItem(desktopDir, "folder") },
       { label: "新建文本文档", icon: "📄", onClick: () => void ops.newItem(desktopDir, "file") },
-      { label: "粘贴", icon: "📋", disabled: !desktopDir, onClick: () => paste.paste(desktopDir) },
+      {
+        label: clip?.paths.length ? `粘贴「${baseName(clip.paths[0])}」` : "粘贴",
+        icon: "📋",
+        disabled: !desktopDir,
+        onClick: () => paste.paste(desktopDir),
+      },
+      ...(clip?.paths.length
+        ? [{ label: "从本地电脑粘贴文件…", icon: "📥", disabled: !desktopDir, onClick: () => paste.pasteLocal(desktopDir) }]
+        : []),
       { divider: true },
       { label: "在此处打开终端", icon: "⌨️", onClick: () => wm.open("systerm", { path: desktopDir }) },
       { label: "打开桌面文件夹", icon: "📂", onClick: () => wm.open("sysfiles", { path: desktopDir }) },
@@ -158,6 +185,28 @@ function Shell() {
       { divider: true },
       { label: "刷新", icon: "🔄", onClick: () => { bump(); void fs.reload(); } },
     ]);
+
+  const onDesktopKeyDown = (e: React.KeyboardEvent) => {
+    const selIcon = icons.find((x) => x.key === selected);
+    if (!selIcon || selIcon.kind !== "entry") return;
+    const en = selIcon.entry;
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+      const k = e.key.toLowerCase();
+      if (k === "c") {
+        e.preventDefault();
+        copyEntryItem(en, false);
+        return;
+      }
+      if (k === "x") {
+        e.preventDefault();
+        copyEntryItem(en, true);
+        return;
+      }
+    }
+    if (e.key === "Enter") openEntry(en);
+    else if (e.key === "F2") void ops.renameDialog(en.path);
+    else if (e.key === "Delete") void ops.trash(en.path);
+  };
 
   // 拖拽到桌面 / 文件夹图标 / 回收站，真实移动服务器上的文件；从 Windows 拖进来的文件则上传（回收站除外）
   const acceptDrop = (target: string, trash = false) => ({
@@ -203,6 +252,7 @@ function Shell() {
         className="absolute inset-x-0 top-0 bottom-14 p-2 outline-none"
         tabIndex={-1}
         data-paste-dir={desktopDir || undefined}
+        onKeyDown={onDesktopKeyDown}
         onClick={() => {
           setSelected(null);
           setStartOpen(false);

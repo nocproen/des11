@@ -27,8 +27,72 @@ const WELCOME = `欢迎来到真实系统桌面！
   • "系统监视器"读取的是 /proc 里真实的 CPU、内存、进程信息
   • 在桌面上新建、删除、拖动文件，服务器上的文件会同步变化
 
+【VNC 文件与图片复制粘贴指南】
+  1. 在模拟桌面或文件管理器上右键「示例图片.png」（或任意文件）点击「复制」或按 Ctrl+C
+  2. 打开任意 VNC 应用（如「浏览器」或桌面上的「VNC 文件管理器」），在窗口内按 Ctrl+V、右键粘贴、或点击窗口右下角「📋」按钮，即可直接粘贴图片或文件
+  3. 也可以直接把桌面上的图片或文件拖拽到 VNC 窗口内松手自动粘贴
+
 请谨慎操作：这里的删除和命令都是真实生效的。
 `;
+
+const SAMPLE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="50%" stop-color="#1e3a8a"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+  </defs>
+  <rect width="640" height="400" rx="24" fill="url(#bg)"/>
+  <circle cx="520" cy="90" r="110" fill="#38bdf8" fill-opacity="0.14"/>
+  <circle cx="120" cy="330" r="130" fill="#34d399" fill-opacity="0.14"/>
+  <rect x="44" y="44" width="552" height="312" rx="18" fill="#0f172a" fill-opacity="0.55" stroke="#ffffff" stroke-opacity="0.18" stroke-width="2"/>
+  <rect x="76" y="84" width="96" height="96" rx="20" fill="url(#accent)"/>
+  <text x="124" y="148" font-family="DejaVu Sans, Noto Sans CJK SC, sans-serif" font-size="44" font-weight="bold" fill="#0f172a" text-anchor="middle">VNC</text>
+  <text x="200" y="122" font-family="DejaVu Sans, Noto Sans CJK SC, sans-serif" font-size="28" font-weight="bold" fill="#f8fafc">桌面示例图片 · Sample Image</text>
+  <text x="200" y="160" font-family="DejaVu Sans, Noto Sans CJK SC, sans-serif" font-size="17" fill="#cbd5e1">支持复制粘贴到 VNC 应用 / 浏览器 / 文件管理器</text>
+  <rect x="76" y="212" width="488" height="2" fill="url(#accent)" fill-opacity="0.5"/>
+  <text x="76" y="256" font-family="DejaVu Sans, Noto Sans CJK SC, sans-serif" font-size="16" fill="#94a3b8">• 右键此图片选择「复制」或「复制图片」，或选中后按 Ctrl+C</text>
+  <text x="76" y="288" font-family="DejaVu Sans, Noto Sans CJK SC, sans-serif" font-size="16" fill="#94a3b8">• 在 VNC 窗口中按 Ctrl+V、点右下角 📋 按钮、或直接拖入窗口</text>
+  <text x="76" y="320" font-family="DejaVu Sans, Noto Sans CJK SC, sans-serif" font-size="14" fill="#38bdf8">MIME: image/png + text/uri-list + x-special/gnome-copied-files</text>
+</svg>`;
+
+const VNC_FM_DESKTOP = `[Desktop Entry]
+Type=Application
+Name=VNC 文件管理器
+Name[zh_CN]=VNC 文件管理器
+Comment=在 VNC 窗口中运行 PCManFM，可测试直接粘贴桌面复制的文件或图片
+Exec=pcmanfm ${DOCUMENTS}
+Icon=system-file-manager
+Terminal=false
+`;
+
+async function ensureSampleAssets() {
+  const samplePng = path.join(DESKTOP, "示例图片.png");
+  try {
+    await fsp.access(samplePng);
+  } catch {
+    try {
+      const sharp = (await import("sharp")).default;
+      const pngBuf = await sharp(Buffer.from(SAMPLE_SVG)).png().toBuffer();
+      await fsp.writeFile(samplePng, pngBuf);
+      await fsp.writeFile(path.join(PICTURES, "示例图片.png"), pngBuf).catch(() => {});
+    } catch {
+      /* ignore */
+    }
+  }
+  const fmLauncher = path.join(DESKTOP, "VNC文件管理器.desktop");
+  try {
+    await fsp.access(fmLauncher);
+  } catch {
+    await fsp.writeFile(fmLauncher, VNC_FM_DESKTOP, { mode: 0o755 }).catch(() => {});
+    await fsp.chmod(fmLauncher, 0o755).catch(() => {});
+  }
+}
 
 let ensured: Promise<void> | null = null;
 export function ensureHome() {
@@ -44,6 +108,7 @@ export function ensureHome() {
         await fsp.writeFile(path.join(DESKTOP, "欢迎使用.txt"), WELCOME, { flag: "wx" }).catch(() => {});
         await fsp.writeFile(marker, new Date().toISOString());
       }
+      await ensureSampleAssets();
     } catch (e) {
       console.error("ensureHome failed", e);
     }
@@ -147,6 +212,44 @@ export async function movePath(src: string, dst: string) {
       await fsp.rm(src, { recursive: true, force: true });
     } else throw e;
   }
+}
+
+/** 生成目标目录中不重名的文件路径（例如 "示例图片 - 副本.png" 或 "示例图片 (2).png"） */
+export async function uniqueDestPath(destDir: string, baseNameStr: string, sameDirCopy = false): Promise<string> {
+  const ext = path.extname(baseNameStr);
+  const stem = ext ? baseNameStr.slice(0, -ext.length) : baseNameStr;
+  const firstCandidate = sameDirCopy ? path.join(destDir, `${stem} - 副本${ext}`) : path.join(destDir, baseNameStr);
+  if (!(await exists(firstCandidate))) return firstCandidate;
+  for (let i = 2; i < 1000; i++) {
+    const candidate = sameDirCopy
+      ? path.join(destDir, `${stem} - 副本 (${i})${ext}`)
+      : path.join(destDir, `${stem} (${i})${ext}`);
+    if (!(await exists(candidate))) return candidate;
+  }
+  return path.join(destDir, `${stem}-${Date.now()}${ext}`);
+}
+
+/** 复制或剪切（移动）文件/文件夹到目标目录 */
+export async function copyEntryToDir(src: string, destDir: string, cut = false): Promise<string> {
+  const st = await fsp.lstat(src);
+  const dirStat = await fsp.stat(destDir);
+  if (!dirStat.isDirectory()) throw new Error("目标不是目录");
+
+  const srcDir = path.dirname(src);
+  const base = path.basename(src);
+  if (cut && srcDir === destDir) return src;
+  if (st.isDirectory() && (destDir === src || destDir.startsWith(src + path.sep))) {
+    throw new Error("不能把文件夹复制或移动到它自己里面");
+  }
+
+  const dst = await uniqueDestPath(destDir, base, !cut && srcDir === destDir);
+  if (cut) {
+    if (isProtected(src)) throw new Error("受保护的系统路径，不能移动");
+    await movePath(src, dst);
+  } else {
+    await fsp.cp(src, dst, { recursive: true, preserveTimestamps: true });
+  }
+  return dst;
 }
 
 export async function moveToTrash(p: string) {

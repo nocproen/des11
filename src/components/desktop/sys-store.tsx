@@ -34,7 +34,38 @@ export type SysInfoLite = {
   os: string;
 };
 
+export type SysClip = {
+  paths: string[];
+  cut: boolean;
+  ts: number;
+};
+
 export const SYS_DRAG_KEY = "application/x-sys-path";
+export const SYS_CLIP_STORAGE_KEY = "wd_sys_clip";
+
+export function readStoredSysClip(): SysClip | null {
+  try {
+    const raw = localStorage.getItem(SYS_CLIP_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as SysClip;
+    if (Array.isArray(parsed?.paths) && parsed.paths.length > 0) return parsed;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+export function writeStoredSysClip(clip: SysClip | null) {
+  try {
+    if (clip && clip.paths.length) {
+      localStorage.setItem(SYS_CLIP_STORAGE_KEY, JSON.stringify(clip));
+    } else {
+      localStorage.removeItem(SYS_CLIP_STORAGE_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
+}
 
 async function call<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, {
@@ -74,6 +105,13 @@ export const sysApi = {
     call<{ path: string }>("/api/sys/fs", { method: "PATCH", body: json({ path, name }) }),
   move: (path: string, moveTo: string) =>
     call<{ path: string }>("/api/sys/fs", { method: "PATCH", body: json({ path, moveTo }) }),
+  copyPaste: (destDir: string, copyPaths?: string[], cut = false, pasteFromVnc = false) =>
+    call<{ paths: string[]; count: number; cut: boolean }>("/api/sys/fs", {
+      method: "PATCH",
+      body: json({ destDir, copyPaths, cut, pasteFromVnc }),
+    }),
+  syncVncClipboard: (paths: string[], cut = false) =>
+    call<{ ok: boolean }>("/api/gui/clipboard", { method: "POST", body: json({ paths, cut }) }),
   restore: (path: string) =>
     call("/api/sys/fs", { method: "PATCH", body: json({ path, restore: true }) }),
   trash: (path: string) => call(`/api/sys/fs?path=${q(path)}`, { method: "DELETE" }),
@@ -106,6 +144,8 @@ type SysApiCtx = {
   desktopItems: SysEntry[];
   version: number;
   bump: () => void;
+  clip: SysClip | null;
+  setClip: (c: SysClip | null) => void;
 };
 
 const Ctx = createContext<SysApiCtx | null>(null);
@@ -121,9 +161,20 @@ export function SysProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const [desktopItems, setDesktopItems] = useState<SysEntry[]>([]);
   const [version, setVersion] = useState(0);
+  const [clip, setClipState] = useState<SysClip | null>(null);
   const bump = useCallback(() => setVersion((v) => v + 1), []);
 
+  const setClip = useCallback((next: SysClip | null) => {
+    setClipState(next);
+    writeStoredSysClip(next);
+  }, []);
+
   useEffect(() => {
+    const initialClip = readStoredSysClip();
+    if (initialClip) {
+      setClipState(initialClip);
+      void sysApi.syncVncClipboard(initialClip.paths, initialClip.cut).catch(() => {});
+    }
     let alive = true;
     call<SysInfoLite>("/api/sys/info?lite=1")
       .then((i) => alive && setInfo(i))
@@ -155,8 +206,8 @@ export function SysProvider({ children }: { children: ReactNode }) {
   }, [desktop, version]);
 
   const value = useMemo(
-    () => ({ ready, info, desktopItems, version, bump }),
-    [ready, info, desktopItems, version, bump],
+    () => ({ ready, info, desktopItems, version, bump, clip, setClip }),
+    [ready, info, desktopItems, version, bump, clip, setClip],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
@@ -164,7 +215,7 @@ export function SysProvider({ children }: { children: ReactNode }) {
 // 带错误提示的真实文件操作
 export function useSysOps() {
   const dlg = useDialogs();
-  const { bump } = useSys();
+  const { bump, clip, setClip } = useSys();
 
   return useMemo(() => {
     const run = async <T,>(fn: () => Promise<T>): Promise<T | null> => {
@@ -182,6 +233,45 @@ export function useSysOps() {
         run(() => sysApi.create(dir, name, kind, content)),
       rename: (path: string, name: string) => run(() => sysApi.rename(path, name)),
       move: (path: string, dest: string) => run(() => sysApi.move(path, dest)),
+      copy: async (target: string | string[], cut = false) => {
+        const paths = (Array.isArray(target) ? target : [target]).filter(Boolean);
+        if (!paths.length) return false;
+        const next: SysClip = { paths, cut, ts: Date.now() };
+        setClip(next);
+        try {
+          await sysApi.syncVncClipboard(paths, cut);
+          const label = paths.length === 1 ? `「${baseName(paths[0])}」` : `${paths.length} 个项目`;
+          dlg.toast(
+            cut
+              ? `已剪切 ${label}（可在文件夹或 VNC 应用中粘贴）`
+              : `已复制 ${label}（可直接粘贴到 VNC 应用或文件夹）`,
+          );
+          return true;
+        } catch (e) {
+          dlg.toast(e instanceof Error ? e.message : "复制失败");
+          return false;
+        }
+      },
+      pasteFiles: async (destDir: string, pasteFromVnc = false) => {
+        if (!pasteFromVnc && (!clip || !clip.paths.length)) return false;
+        const r = await run(() =>
+          sysApi.copyPaste(
+            destDir,
+            pasteFromVnc ? undefined : clip?.paths,
+            pasteFromVnc ? false : !!clip?.cut,
+            pasteFromVnc,
+          ),
+        );
+        if (!r) return false;
+        if (!pasteFromVnc && clip?.cut) setClip(null);
+        const where = baseName(destDir);
+        dlg.toast(
+          r.count === 1
+            ? `已粘贴「${baseName(r.paths[0])}」到 ${where}`
+            : `已粘贴 ${r.count} 个项目到 ${where}`,
+        );
+        return true;
+      },
       trash: async (path: string) => {
         const r = await run(() => sysApi.trash(path));
         if (r) dlg.toast("已移到回收站");
@@ -232,7 +322,7 @@ export function useSysOps() {
         return run(() => sysApi.rename(path, name.trim()));
       },
     };
-  }, [dlg, bump]);
+  }, [dlg, bump, clip, setClip]);
 }
 
 // 应用图标（按图标名或绝对路径，由服务器在系统图标主题里查找）

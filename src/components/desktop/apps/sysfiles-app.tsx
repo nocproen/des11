@@ -50,7 +50,7 @@ export function SysFilesApp({ win }: { win: Win }) {
   const menu = useContextMenu();
   const ops = useSysOps();
   const paste = usePaste();
-  const { info, version } = useSys();
+  const { info, version, clip } = useSys();
 
   const path = win.path ?? "~";
   const [data, setData] = useState<{ path: string; parent: string | null; entries: SysEntry[] } | null>(
@@ -122,6 +122,13 @@ export function SysFilesApp({ win }: { win: Win }) {
 
   const termHere = (dir: string) => wm.open("systerm", { path: dir });
 
+  const copyFileItem = (en: SysEntry, cut = false) => {
+    void ops.copy(en.path, cut);
+    if (!cut && isImage(en.name) && en.kind === "file") {
+      void copyImage(en.path).catch(() => {});
+    }
+  };
+
   const entryMenu = (e: React.MouseEvent, en: SysEntry) => {
     setSelected(en.path);
     if (inTrash) {
@@ -134,8 +141,10 @@ export function SysFilesApp({ win }: { win: Win }) {
     menu.show(e, [
       { label: "打开", icon: "📂", onClick: () => open(en) },
       ...entryExtraMenu(wm, en),
+      { label: "复制（可粘贴到 VNC / 文件夹）", icon: "📋", onClick: () => copyFileItem(en, false) },
+      { label: "剪切", icon: "✂️", onClick: () => copyFileItem(en, true) },
       ...(en.kind === "folder"
-        ? [{ label: "粘贴到此文件夹", icon: "📋", onClick: () => paste.paste(en.path) }]
+        ? [{ label: "粘贴到此文件夹", icon: "📥", onClick: () => paste.paste(en.path) }]
         : []),
       {
         label: "在终端中打开",
@@ -145,7 +154,7 @@ export function SysFilesApp({ win }: { win: Win }) {
       { label: "重命名", icon: "✏️", onClick: () => void ops.renameDialog(en.path) },
       {
         label: "复制路径",
-        icon: "📋",
+        icon: "🔗",
         onClick: () => {
           void navigator.clipboard?.writeText(en.path);
           dlg.toast("路径已复制");
@@ -153,7 +162,16 @@ export function SysFilesApp({ win }: { win: Win }) {
       },
       { label: "下载到电脑", icon: "⬇️", onClick: () => downloadEntry(en) },
       ...(isImage(en.name) && en.kind === "file"
-        ? [{ label: "复制图片", icon: "🖼️", onClick: () => void copyImage(en.path).then(() => dlg.toast("图片已复制，可以在 Windows 里粘贴"), () => dlg.toast("复制失败，浏览器不允许访问剪贴板")) }]
+        ? [
+            {
+              label: "复制图片（同步 VNC 与本机）",
+              icon: "🖼️",
+              onClick: () => {
+                void ops.copy(en.path, false);
+                void copyImage(en.path).catch(() => {});
+              },
+            },
+          ]
         : []),
       { divider: true },
       { label: "移到回收站", icon: "🗑️", danger: true, onClick: () => void ops.trash(en.path) },
@@ -170,7 +188,14 @@ export function SysFilesApp({ win }: { win: Win }) {
     menu.show(e, [
       { label: "新建文件夹", icon: "📁", onClick: () => void ops.newItem(cur, "folder") },
       { label: "新建文本文档", icon: "📄", onClick: () => void ops.newItem(cur, "file") },
-      { label: "粘贴", icon: "📋", onClick: () => paste.paste(cur) },
+      {
+        label: clip?.paths.length ? `粘贴「${baseName(clip.paths[0])}」` : "粘贴",
+        icon: "📋",
+        onClick: () => paste.paste(cur),
+      },
+      ...(clip?.paths.length
+        ? [{ label: "从本地电脑粘贴文件…", icon: "📥", onClick: () => paste.pasteLocal(cur) }]
+        : []),
       { divider: true },
       { label: "在此处打开终端", icon: "⌨️", onClick: () => termHere(cur) },
       {
@@ -207,6 +232,19 @@ export function SysFilesApp({ win }: { win: Win }) {
   const onKey = (e: React.KeyboardEvent) => {
     const en = entries.find((x) => x.path === selected);
     if (!en) return;
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && !inTrash) {
+      const k = e.key.toLowerCase();
+      if (k === "c") {
+        e.preventDefault();
+        copyFileItem(en, false);
+        return;
+      }
+      if (k === "x") {
+        e.preventDefault();
+        copyFileItem(en, true);
+        return;
+      }
+    }
     if (e.key === "Enter") open(en);
     if (e.key === "F2") void ops.renameDialog(en.path);
     if (e.key === "Delete") void (inTrash ? ops.destroy(en.path) : ops.trash(en.path));

@@ -42,6 +42,15 @@ type Gui = {
   stalls: number; // 发生过多少次发送积压（带宽不够的直接信号）
 };
 
+export type ServerClip = {
+  kind: "files" | "image" | "text";
+  paths: string[];
+  cut: boolean;
+  pngPath?: string;
+  text?: string;
+  ts: number;
+};
+
 type Store = {
   cleaned?: boolean;
   browserPkgs?: Promise<void>;
@@ -53,10 +62,13 @@ type Store = {
   pick: Promise<unknown>;
   timer?: NodeJS.Timeout;
   apps?: { t: number; v: { apps: DesktopEntry[]; desktop: DesktopEntry[] } };
+  clip?: ServerClip | null;
+  clipProcs?: Map<number, ChildProcess>;
 };
 const holder = globalThis as unknown as { __wdGui?: Store };
 const G: Store = (holder.__wdGui ??= { sessions: new Map(), stackNote: "", pick: Promise.resolve(), lastBrowserStop: -1e9 });
 G.lastBrowserStop ??= -1e9;
+G.clipProcs ??= new Map();
 
 const MAX_SESSIONS = 4;
 // 没有任何网页连着时，应用多保留多久（网页端会在这段时间内自动重连）。
@@ -73,7 +85,7 @@ const clamp = (v: unknown, lo: number, hi: number, d: number) => {
 
 /* ---------------- 图形环境：首次使用时自动安装 ---------------- */
 
-const NEED_BINS = ["Xvnc", "openbox", "dbus-run-session"];
+const NEED_BINS = ["Xvnc", "openbox", "dbus-run-session", "xclip", "xdotool"];
 const PKGS = [
   "tigervnc-standalone-server",
   "openbox",
@@ -84,6 +96,13 @@ const PKGS = [
   "xterm",
   "fonts-dejavu-core",
   "xdg-utils",
+  "xclip",
+  "xsel",
+  "xdotool",
+  "python3-gi",
+  "gir1.2-gtk-3.0",
+  "python3-pil",
+  "pcmanfm",
 ];
 
 async function hasBin(name: string) {
@@ -592,6 +611,9 @@ async function startSession(g: Gui, delayMs = 0) {
     if (!g.stopped) {
       g.state = "running";
       g.note = "";
+      if (G.clip) {
+        void applyClipToDisplay(g.display, G.clip).catch(() => {});
+      }
     }
   } catch (e) {
     finish(g, "failed", e instanceof Error ? e.message : "启动失败");
@@ -911,49 +933,323 @@ function toPngWithImageMagick(data: Buffer) {
   });
 }
 
-/** 把一张图片放进会话的 X 剪贴板（xclip 会留在后台持有剪贴板，直到下次被替换） */
-export async function setClipboardImage(g: { display: number }, data: Buffer, mime: string) {
-  if (!/^image\/(png|jpeg|gif|webp|bmp)$/.test(mime)) throw new Error("不支持的图片格式");
-  // Chromium / Electron 系应用（Claude、浏览器）在 Linux 上只从剪贴板读 image/png，其他格式一律先转成 PNG
-  if (mime !== "image/png") {
+const CLIP_TMP_DIR = "/tmp/wd-clip-files";
+const IMG_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+
+async function ensurePngForFile(filePath: string): Promise<string | undefined> {
+  if (!IMG_EXT_RE.test(filePath)) return undefined;
+  try {
+    const st = await fsp.stat(filePath);
+    if (!st.isFile() || st.size > 32 * 1024 * 1024) return undefined;
+    if (/\.png$/i.test(filePath)) return filePath;
+    await fsp.mkdir(CLIP_TMP_DIR, { recursive: true });
+    const outPath = path.join(CLIP_TMP_DIR, `conv-${ path.basename(filePath, path.extname(filePath)) }-${Math.round(st.mtimeMs)}.png`);
+    try {
+      await fsp.access(outPath);
+      return outPath;
+    } catch {
+      /* need convert */
+    }
+    const raw = await fsp.readFile(filePath);
     const sharp = (await import("sharp")).default;
-    const src = data;
-    data = await sharp(src, { animated: false })
+    const pngBuf = await sharp(raw, { animated: false })
       .png()
       .toBuffer()
-      .catch(() => toPngWithImageMagick(src)); // sharp 不支持 BMP
-    mime = "image/png";
+      .catch(() => toPngWithImageMagick(raw));
+    await fsp.writeFile(outPath, pngBuf);
+    return outPath;
+  } catch {
+    return undefined;
   }
-  const env = await guiEnv(g.display);
-  await new Promise<void>((resolve, reject) => {
-    const p = spawn("xclip", ["-selection", "clipboard", "-t", mime, "-i"], { detached: true, stdio: ["pipe", "ignore", "ignore"], env });
-    p.on("error", () => reject(new Error("缺少 xclip，请先安装：sudo apt-get install xclip")));
-    p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("写入剪贴板失败"))));
-    p.stdin!.end(data);
-  });
+}
+
+export async function prepareClipPayload(paths: string[], cut = false, textOverride?: string): Promise<ServerClip> {
+  const validPaths: string[] = [];
+  for (const p of paths) {
+    try {
+      await fsp.lstat(p);
+      validPaths.push(p);
+    } catch {
+      /* ignore missing */
+    }
+  }
+  if (!validPaths.length && !textOverride) {
+    throw new Error("要复制的文件不存在");
+  }
+  let pngPath: string | undefined;
+  if (validPaths.length === 1) {
+    pngPath = await ensurePngForFile(validPaths[0]);
+  }
+  const formattedPaths = validPaths.map((p) => (/\s/.test(p) ? `"${p}"` : p)).join(" ");
+  return {
+    kind: pngPath ? "image" : validPaths.length ? "files" : "text",
+    paths: validPaths,
+    cut,
+    pngPath,
+    text: textOverride ?? formattedPaths,
+    ts: Date.now(),
+  };
 }
 
 /**
- * 把服务器上的文件"拖"进应用：在松手的位置点一下（让输入框获得焦点），再把文件路径作为文字粘贴进去。
- * 只放纯文字：往剪贴板塞图片会让 Claude（Electron）读剪贴板时卡死白屏；逐字输入又会被远程拼音输入法拦截。
+ * 将剪贴板数据应用到指定虚拟显示器 (DISPLAY=:display)
+ * 同时提供 image/png、x-special/gnome-copied-files、text/uri-list、UTF8_STRING 等多种目标格式，
+ * 使得 VNC 内的浏览器、文件管理器 (PCManFM/Thunar/Nautilus)、聊天/图像软件及终端均能直接粘贴文件或图片。
+ */
+export async function applyClipToDisplay(display: number, clip: ServerClip): Promise<void> {
+  if (display < 0) return;
+  const binDir = await ensureBin();
+  const env = await guiEnv(display, binDir);
+  const clipProcs = (G.clipProcs ??= new Map());
+  const prev = clipProcs.get(display);
+  if (prev && prev.exitCode === null) {
+    try {
+      prev.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+    clipProcs.delete(display);
+  }
+
+  const scriptPath = path.join(binDir, "wd-clip.py");
+  const ok = await new Promise<boolean>((resolve) => {
+    const p = spawn("python3", [scriptPath], {
+      detached: true,
+      stdio: ["pipe", "pipe", "ignore"],
+      env,
+    });
+    clipProcs.set(display, p);
+    let settled = false;
+    const finish = (v: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      p.stdout?.removeAllListeners();
+      p.unref?.();
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(false), 2500);
+    let out = "";
+    p.stdout?.on("data", (d: Buffer) => {
+      out += d.toString("utf8");
+      if (out.includes("READY")) finish(true);
+    });
+    p.on("error", () => finish(false));
+    p.on("exit", () => finish(false));
+    try {
+      p.stdin?.end(JSON.stringify(clip));
+    } catch {
+      finish(false);
+    }
+  });
+
+  if (ok) return;
+
+  // 回退方案：使用 xclip 写入
+  if (clip.pngPath) {
+    const pngData = await fsp.readFile(clip.pngPath);
+    await new Promise<void>((resolve, reject) => {
+      const p = spawn("xclip", ["-selection", "clipboard", "-t", "image/png", "-i"], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
+        env,
+      });
+      p.on("error", () => reject(new Error("缺少 xclip")));
+      p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("写入剪贴板失败"))));
+      p.stdin!.end(pngData);
+    });
+  } else if (clip.text) {
+    await new Promise<void>((resolve, reject) => {
+      const p = spawn("xclip", ["-selection", "clipboard", "-i"], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
+        env,
+      });
+      p.on("error", () => reject(new Error("缺少 xclip")));
+      p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("写入剪贴板失败"))));
+      p.stdin!.end(clip.text);
+    });
+  }
+}
+
+async function runXdo(display: number, args: string[]) {
+  const env = await guiEnv(display);
+  await new Promise<void>((resolve, reject) => {
+    const p = spawn("xdotool", args, { stdio: "ignore", env });
+    p.on("error", () => reject(new Error("缺少 xdotool，请先安装：sudo apt-get install xdotool")));
+    p.on("exit", () => resolve());
+  });
+}
+
+/** 设置全局服务器剪贴板（从模拟桌面或文件管理器复制/剪切文件或图片），并同步到所有运行中的 VNC 会话 */
+export async function setServerClipFiles(paths: string[], cut = false): Promise<ServerClip> {
+  const clip = await prepareClipPayload(paths, cut);
+  G.clip = clip;
+  const tasks: Promise<void>[] = [];
+  for (const s of G.sessions.values()) {
+    if (s.state === "running" && s.display >= 0) {
+      tasks.push(applyClipToDisplay(s.display, clip).catch(() => {}));
+    }
+  }
+  await Promise.all(tasks);
+  return clip;
+}
+
+export function getServerClip(): ServerClip | null {
+  return G.clip ?? null;
+}
+
+/** 读取运行中的 VNC 会话剪贴板（若用户在 VNC 内部复制了文件或图片，可粘贴回模拟桌面） */
+export async function readVncClipboard(): Promise<ServerClip | null> {
+  const running = [...G.sessions.values()]
+    .filter((s) => s.state === "running" && s.display >= 0)
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+  const binDir = await ensureBin();
+  const scriptPath = path.join(binDir, "wd-clip.py");
+  for (const s of running) {
+    try {
+      const env = await guiEnv(s.display, binDir);
+      const res = await new Promise<ServerClip | null>((resolve) => {
+        execFile("python3", [scriptPath, "--get"], { env, timeout: 2500 }, (err, stdout) => {
+          if (err || !stdout) return resolve(null);
+          try {
+            const parsed = JSON.parse(String(stdout).trim()) as {
+              kind?: string;
+              paths?: string[];
+              pngPath?: string;
+              cut?: boolean;
+              text?: string;
+            };
+            if (parsed.kind === "files" && parsed.paths?.length) {
+              return resolve({
+                kind: "files",
+                paths: parsed.paths,
+                cut: !!parsed.cut,
+                ts: Date.now(),
+              });
+            }
+            if (parsed.kind === "image" && parsed.pngPath) {
+              return resolve({
+                kind: "image",
+                paths: [parsed.pngPath],
+                pngPath: parsed.pngPath,
+                cut: false,
+                ts: Date.now(),
+              });
+            }
+          } catch {
+            /* ignore */
+          }
+          resolve(null);
+        });
+      });
+      if (res) return res;
+    } catch {
+      /* next session */
+    }
+  }
+  return G.clip ?? null;
+}
+
+/** 将服务器上的文件或图片写入指定 VNC 会话剪贴板，可选立即触发 Ctrl+V 粘贴 */
+export async function setClipboardFilesForSession(
+  g: { display: number },
+  paths: string[],
+  cut = false,
+  triggerPaste = false,
+): Promise<ServerClip> {
+  const clip = await prepareClipPayload(paths, cut);
+  G.clip = clip;
+  await applyClipToDisplay(g.display, clip);
+  if (triggerPaste) {
+    await sleep(60);
+    await runXdo(g.display, ["key", "--clearmodifiers", "ctrl+v"]);
+  }
+  return clip;
+}
+
+/** 触发指定 VNC 会话执行粘贴（如果服务端有已复制的文件/图片，先确保同步到该显示器） */
+export async function triggerVncPaste(g: { display: number }, x?: number, y?: number) {
+  if (G.clip) {
+    await applyClipToDisplay(g.display, G.clip);
+  }
+  if (Number.isFinite(x) && Number.isFinite(y)) {
+    await runXdo(g.display, ["mousemove", String(Math.round(x!)), String(Math.round(y!)), "click", "1"]);
+    await sleep(120);
+  }
+  await runXdo(g.display, ["key", "--clearmodifiers", "ctrl+v"]);
+}
+
+/** 把上传的图片或任意文件写入会话的 X 剪贴板（同时支持 image/png、text/uri-list、x-special/gnome-copied-files、UTF8_STRING） */
+export async function setClipboardUploadedFile(
+  g: { display: number },
+  data: Buffer,
+  mime: string,
+  filename?: string,
+  triggerPaste = false,
+  x?: number,
+  y?: number,
+) {
+  await fsp.mkdir(CLIP_TMP_DIR, { recursive: true });
+  const isImg = /^image\/(png|jpeg|gif|webp|bmp|svg\+xml)$/.test(mime) || (filename ? IMG_EXT_RE.test(filename) : false);
+  let safeName = (filename ?? "").replace(/[/\\\0]/g, "_").trim();
+  if (!safeName) {
+    const ext = isImg ? "png" : mime.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "bin";
+    safeName = `粘贴的文件-${Date.now()}.${ext}`;
+  }
+  let fileData = data;
+  if (isImg && mime !== "image/png" && !/\.png$/i.test(safeName)) {
+    const sharp = (await import("sharp")).default;
+    const src = data;
+    fileData = await sharp(src, { animated: false })
+      .png()
+      .toBuffer()
+      .catch(() => toPngWithImageMagick(src));
+    safeName = safeName.replace(/\.[^.]+$/, "") + ".png";
+  }
+  const savedPath = path.join(CLIP_TMP_DIR, `${Date.now()}-${safeName}`);
+  await fsp.writeFile(savedPath, fileData);
+
+  const clip: ServerClip = {
+    kind: isImg ? "image" : "files",
+    paths: [savedPath],
+    cut: false,
+    pngPath: isImg ? savedPath : undefined,
+    text: /\s/.test(savedPath) ? `"${savedPath}"` : savedPath,
+    ts: Date.now(),
+  };
+  G.clip = clip;
+  await applyClipToDisplay(g.display, clip);
+
+  if (Number.isFinite(x) && Number.isFinite(y)) {
+    await runXdo(g.display, ["mousemove", String(Math.round(x!)), String(Math.round(y!)), "click", "1"]);
+    await sleep(120);
+  }
+  if (triggerPaste || (Number.isFinite(x) && Number.isFinite(y))) {
+    await sleep(60);
+    await runXdo(g.display, ["key", "--clearmodifiers", "ctrl+v"]);
+  }
+  return clip;
+}
+
+/** 把一张图片放进会话的 X 剪贴板（兼容原有调用，并同时提供文件 URI 与图片格式） */
+export async function setClipboardImage(g: { display: number }, data: Buffer, mime: string) {
+  if (!/^image\/(png|jpeg|gif|webp|bmp)$/.test(mime)) throw new Error("不支持的图片格式");
+  await setClipboardUploadedFile(g, data, mime, `剪贴板图片-${Date.now()}.png`, false);
+}
+
+/**
+ * 把服务器上的文件或图片"拖"进或粘贴进应用：
+ * 同时在 X11 剪贴板设置 image/png（若是图片）、x-special/gnome-copied-files、text/uri-list 和文件路径文字，
+ * 随后在松手位置点击并发送 Ctrl+V，使支持图片粘贴、文件粘贴或路径粘贴的 VNC 应用都能直接接收。
  */
 export async function dropFile(g: { display: number }, file: string, x: number, y: number) {
   await fsp.stat(file); // 文件不存在就报错
-  const env = await guiEnv(g.display);
-  await new Promise<void>((resolve, reject) => {
-    const p = spawn("xclip", ["-selection", "clipboard", "-i"], { detached: true, stdio: ["pipe", "ignore", "ignore"], env });
-    p.on("error", () => reject(new Error("缺少 xclip，请先安装：sudo apt-get install xclip")));
-    p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("写入剪贴板失败"))));
-    p.stdin!.end(`${/\s/.test(file) ? `"${file}"` : file} `);
-  });
-  const xdo = (args: string[]) =>
-    new Promise<void>((resolve, reject) => {
-      const p = spawn("xdotool", args, { stdio: "ignore", env });
-      p.on("error", () => reject(new Error("缺少 xdotool，请先安装：sudo apt-get install xdotool")));
-      p.on("exit", () => resolve());
-    });
-  await xdo(["mousemove", String(Math.round(x)), String(Math.round(y)), "click", "1"]);
-  await new Promise((r) => setTimeout(r, 150));
-  await xdo(["key", "--clearmodifiers", "ctrl+v"]);
-  return { path: file };
+  const clip = await prepareClipPayload([file], false, `${/\s/.test(file) ? `"${file}"` : file} `);
+  G.clip = clip;
+  await applyClipToDisplay(g.display, clip);
+  await runXdo(g.display, ["mousemove", String(Math.round(x)), String(Math.round(y)), "click", "1"]);
+  await sleep(150);
+  await runXdo(g.display, ["key", "--clearmodifiers", "ctrl+v"]);
+  return { path: file, kind: clip.kind };
 }

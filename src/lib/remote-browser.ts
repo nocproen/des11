@@ -117,15 +117,18 @@ async function launch(): Promise<BrowserContext> {
   }
   let installed = false;
   let deps = false;
+  const sysChromium = (await exists("/usr/bin/chromium")) ? "/usr/bin/chromium" : undefined;
   for (let i = 0; i < 4; i++) {
     try {
       const ctx = await chromium.launchPersistentContext(PROFILE, {
+        executablePath: sysChromium,
         headless: true,
         viewport: { width: 1024, height: 640 },
         locale: "zh-CN",
         acceptDownloads: true,
         ignoreHTTPSErrors: true,
         args: [
+          "--no-sandbox",
           "--disable-blink-features=AutomationControlled",
           "--disable-dev-shm-usage",
           "--lang=zh-CN",

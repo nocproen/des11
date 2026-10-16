@@ -1,7 +1,9 @@
 import { denyDesktop } from "@/lib/auth";
 import fsp from "fs/promises";
 import path from "path";
+import { readVncClipboard } from "@/lib/gui";
 import {
+  copyEntryToDir,
   destroyTrashed,
   emptyTrash,
   ensureHome,
@@ -100,7 +102,7 @@ export async function PUT(req: Request) {
   }
 }
 
-// 重命名 / 移动 / 从回收站还原
+// 重命名 / 移动 / 复制粘贴 / 从回收站还原
 export async function PATCH(req: Request) {
   const denied = await denyDesktop(req);
   if (denied) return denied;
@@ -109,8 +111,39 @@ export async function PATCH(req: Request) {
     name?: string;
     moveTo?: string;
     restore?: boolean;
+    copyPaths?: string[];
+    destDir?: string;
+    cut?: boolean;
+    pasteFromVnc?: boolean;
   } | null;
-  if (!b || typeof b.path !== "string") return bad("参数无效");
+  if (!b) return bad("参数无效");
+
+  if (typeof b.destDir === "string" && (Array.isArray(b.copyPaths) || b.pasteFromVnc)) {
+    const destDir = resolveP(b.destDir);
+    try {
+      let srcPaths = Array.isArray(b.copyPaths)
+        ? b.copyPaths.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => resolveP(x))
+        : [];
+      let cut = !!b.cut;
+      if (!srcPaths.length && b.pasteFromVnc) {
+        const vncClip = await readVncClipboard();
+        if (vncClip && vncClip.paths.length) {
+          srcPaths = vncClip.paths;
+          cut = vncClip.cut;
+        }
+      }
+      if (!srcPaths.length) return bad("剪贴板中没有可粘贴的文件", 400);
+      const created: string[] = [];
+      for (const s of srcPaths) {
+        created.push(await copyEntryToDir(s, destDir, cut));
+      }
+      return Response.json({ paths: created, count: created.length, cut });
+    } catch (e) {
+      return fsError(e);
+    }
+  }
+
+  if (typeof b.path !== "string") return bad("参数无效");
   const src = resolveP(b.path);
   try {
     if (isProtected(src)) return bad("受保护的系统路径，不能修改", 403);
