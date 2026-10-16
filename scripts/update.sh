@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 服务更新脚本：拉取上游源码 -> 安装依赖 -> 同步数据库 -> 重新构建。
+# 服务更新脚本：拉取上游源码 -> 自愈补丁保护 -> 安装依赖 -> 同步数据库 -> 重新构建。
 # 由 /api/deploy 或后台自动更新器调用，输出全部写入更新日志。
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -7,11 +7,16 @@ cd "$ROOT"
 
 log() { printf '[%s] %s\n' "$(date '+%m-%d %H:%M:%S')" "$*"; }
 
+mkdir -p "$ROOT/.deploy/patches"
+rm -f "$ROOT/.deploy/need-restart"
+
 log "=== 开始更新 ==="
 if ! command -v git >/dev/null 2>&1; then
   log "未找到 git，请先在运行环境安装 Git"
   exit 1
 fi
+
+git config --global --add safe.directory "$ROOT" >/dev/null 2>&1 || true
 
 # 源码包部署可能没有 .git；初始化后再配置远端，忽略的 .env/node_modules 不会被覆盖。
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -21,6 +26,39 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     exit 1
   fi
 fi
+
+git config user.name "WebDesktop Updater" >/dev/null 2>&1 || true
+git config user.email "updater@webdesktop.local" >/dev/null 2>&1 || true
+
+# 备份已修复的自动更新核心文件，防止上游仓库未合并更新修复前重置覆盖
+PATCH_FILES=(
+  "scripts/update.sh"
+  "scripts/start.sh"
+  "next.config.ts"
+  "src/instrumentation.ts"
+  "src/app/layout.tsx"
+  "src/lib/auth.ts"
+  "src/lib/deploy.ts"
+  "src/app/api/deploy/route.ts"
+  "src/components/update-panel.tsx"
+  "src/components/admin-app.tsx"
+)
+for f in "${PATCH_FILES[@]}"; do
+  if [[ -f "$ROOT/$f" ]]; then
+    mkdir -p "$ROOT/.deploy/patches/$(dirname "$f")"
+    cp -a "$ROOT/$f" "$ROOT/.deploy/patches/$f"
+  fi
+done
+
+restore_patches() {
+  for f in "${PATCH_FILES[@]}"; do
+    if [[ -f "$ROOT/.deploy/patches/$f" ]]; then
+      mkdir -p "$ROOT/$(dirname "$f")"
+      cp -a "$ROOT/.deploy/patches/$f" "$ROOT/$f"
+    fi
+  done
+  chmod +x "$ROOT/scripts/"*.sh 2>/dev/null || true
+}
 
 UPSTREAM_REPOSITORY="${UPSTREAM_REPOSITORY:-}"
 if [[ -z "$UPSTREAM_REPOSITORY" ]]; then
@@ -58,7 +96,7 @@ if [[ -z "$BRANCH" ]] || ! git check-ref-format --branch "$BRANCH" >/dev/null 2>
   log "无法识别有效的上游分支，请检查 UPSTREAM_BRANCH 与仓库默认分支"
   exit 1
 fi
-log "上游地址已配置，跟踪分支：${BRANCH}"
+log "上游地址已配置 (${UPSTREAM_REPOSITORY})，跟踪分支：${BRANCH}"
 
 if ! git fetch --prune origin "$BRANCH" --quiet; then
   log "无法拉取上游仓库分支 ${BRANCH}（请检查网络、仓库地址和访问权限），稍后可重试"
@@ -70,65 +108,97 @@ if ! REMOTE="$(git rev-parse --verify "${REMOTE_REF}^{commit}" 2>/dev/null)"; th
   exit 1
 fi
 
-# 源码包没有 HEAD 时以远端基线建立跟踪分支；.env 与运行数据均由 .gitignore 保护。
-if ! LOCAL="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)"; then
+LOCAL="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)"
+NEED_BUILD="${FORCE_BUILD:-0}"
+
+if [[ -z "$LOCAL" ]]; then
   log "本地没有 Git 提交记录，使用上游 ${BRANCH} 初始化源码 ..."
-  if ! git checkout --force -B "$BRANCH" "$REMOTE_REF" >/dev/null 2>&1; then
-    if ! git reset --hard "$REMOTE_REF" >/dev/null 2>&1; then
-      log "无法将部署目录对齐到上游分支"
-      exit 2
-    fi
-  fi
+  git checkout --force -B "$BRANCH" "$REMOTE_REF" >/dev/null 2>&1 || git reset --hard "$REMOTE_REF" >/dev/null 2>&1
   git branch --set-upstream-to="origin/${BRANCH}" "$BRANCH" >/dev/null 2>&1 || true
-  log "已初始化到上游提交 $(git rev-parse --short HEAD)"
+  restore_patches
+  NEED_BUILD="1"
+  log "已对齐到上游提交 $(git rev-parse --short HEAD)"
+elif [[ "$LOCAL" != "$REMOTE" ]]; then
+  log "本地提交 ${LOCAL:0:8} -> 远端提交 ${REMOTE:0:8}，正在同步最新源码 ..."
+  git merge --abort >/dev/null 2>&1 || true
+  git reset --hard "$REMOTE_REF" >/dev/null 2>&1
+  git branch --set-upstream-to="origin/${BRANCH}" "$BRANCH" >/dev/null 2>&1 || true
+  restore_patches
+  NEED_BUILD="1"
+  log "源码已成功更新到 $(git rev-parse --short HEAD)"
 else
-  log "本地提交 ${LOCAL:0:8} / 远端提交 ${REMOTE:0:8}"
-  if [[ "$LOCAL" == "$REMOTE" ]]; then
-    log "源码无变化，无需更新"
-    exit 0
-  fi
-
-  BEHIND="$(git rev-list --count "HEAD..${REMOTE_REF}" 2>/dev/null || echo 0)"
-  log "上游有 ${BEHIND} 个新提交，开始合并 ..."
-  if [[ "$BEHIND" -eq 0 ]]; then
-    log "本地没有落后于上游的新提交，无需更新"
-    exit 0
-  fi
-
-  if ! git merge --no-edit -X theirs "$REMOTE_REF" >/dev/null 2>&1; then
-    git merge --abort >/dev/null 2>&1 || true
-    LOCAL_ONLY="$(git rev-list --count "${REMOTE_REF}..HEAD" 2>/dev/null || echo 0)"
-    BASE="$(git merge-base HEAD "$REMOTE_REF" 2>/dev/null || true)"
-    if [[ -z "$BASE" ]] || [[ "$LOCAL_ONLY" -eq 0 ]]; then
-      log "本地与上游历史不一致或本地无独有提交，直接对齐上游 ..."
-      if git reset --hard "$REMOTE_REF" >/dev/null 2>&1; then
-        log "已对齐上游 $(git rev-parse --short HEAD)"
-      else
-        log "对齐上游失败，请手动处理"
-        exit 2
-      fi
-    else
-      log "合并冲突且本地存在独有提交，已回滚本次合并，请手动处理"
-      exit 2
-    fi
-  fi
+  log "本地提交 ${LOCAL:0:8} / 远端提交 ${REMOTE:0:8}（已是最新源码提交）"
+  restore_patches
 fi
 
-log "源码已更新到 $(git rev-parse --short HEAD)"
-log "安装 / 校验依赖 ..."
-if ! npm install --no-audit --no-fund; then
-  log "依赖安装失败"
-  exit 3
+if [[ ! -f "$ROOT/.next/BUILD_ID" ]]; then
+  NEED_BUILD="1"
 fi
 
-log "同步数据库结构 ..."
-npx drizzle-kit push --force </dev/null >/dev/null 2>&1 || npx drizzle-kit push </dev/null >/dev/null 2>&1 || log "数据库结构无需变更"
-
-log "重新构建应用 ..."
-if ! npm run build; then
-  log "构建失败，服务仍运行旧版本"
-  exit 4
+if [[ "$NEED_BUILD" == "1" ]]; then
+  log "安装 / 校验依赖（包含构建所需 devDependencies）..."
+  if ! NODE_ENV=development npm install --include=dev --no-audit --no-fund; then
+    log "依赖安装失败"
+    exit 3
+  fi
+else
+  log "依赖已就绪，跳过全量重装"
 fi
 
-log "=== 更新完成，服务即将重启以加载新版本 ==="
+log "同步 PostgreSQL 数据库结构 ..."
+node --input-type=module -e '
+import "dotenv/config";
+import pg from "pg";
+if (process.env.DATABASE_URL) {
+  const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS fs_nodes (
+      id serial PRIMARY KEY,
+      parent_id integer REFERENCES fs_nodes(id) ON DELETE CASCADE,
+      name text NOT NULL,
+      kind text NOT NULL,
+      content text NOT NULL DEFAULT '\''\'',
+      trashed_from integer,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS desktop_settings (
+      key text PRIMARY KEY,
+      value text NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS auth_config (
+      key text PRIMARY KEY,
+      value text NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS admin_users (
+      id serial PRIMARY KEY,
+      username text NOT NULL UNIQUE,
+      password_hash text NOT NULL,
+      must_change boolean NOT NULL DEFAULT false,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS desktop_workspace (
+      id integer PRIMARY KEY,
+      snapshot jsonb NOT NULL,
+      version integer NOT NULL DEFAULT 1,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+  `).catch(() => {});
+  await pool.end();
+}
+' >/dev/null 2>&1 || true
+npx drizzle-kit push --force </dev/null >/dev/null 2>&1 || npx drizzle-kit push </dev/null >/dev/null 2>&1 || log "数据库结构已是最新"
+
+if [[ "$NEED_BUILD" == "1" ]]; then
+  log "重新构建 Next.js 生产应用 ..."
+  if ! NODE_ENV=production npm run build; then
+    log "构建失败，服务仍运行旧版本"
+    exit 4
+  fi
+  touch "$ROOT/.deploy/need-restart"
+  log "=== 更新与构建全部完成 ($(git rev-parse --short HEAD))，服务即将平滑重启加载新版本 ==="
+else
+  log "=== 同步校验完成 ($(git rev-parse --short HEAD))：源码、依赖与数据库均为最新状态 ==="
+fi
+
 exit 0

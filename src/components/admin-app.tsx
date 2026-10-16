@@ -35,13 +35,29 @@ export function AdminApp({ slug }: { slug: string }) {
         cache: "no-store",
       });
       const d = (await r.json().catch(() => ({}))) as Record<string, unknown> & { error?: string };
-      if (r.ok && typeof d.sessionId === "string") sessionRef.current = d.sessionId;
+      if (r.ok && typeof d.sessionId === "string") {
+        sessionRef.current = d.sessionId;
+        try {
+          window.sessionStorage.setItem("wd_admin_session", d.sessionId);
+          window.dispatchEvent(new Event("wd-admin-auth"));
+        } catch {}
+      }
       if (r.status === 401 && action !== "login") {
         sessionRef.current = null;
+        try {
+          window.sessionStorage.removeItem("wd_admin_session");
+          window.dispatchEvent(new Event("wd-admin-auth"));
+        } catch {}
         setState(null);
         setPhase("login");
       }
-      if (r.ok && action === "logout") sessionRef.current = null;
+      if (r.ok && action === "logout") {
+        sessionRef.current = null;
+        try {
+          window.sessionStorage.removeItem("wd_admin_session");
+          window.dispatchEvent(new Event("wd-admin-auth"));
+        } catch {}
+      }
       return { ok: r.ok, status: r.status, data: d };
     },
     [slug],
@@ -177,8 +193,203 @@ function Panel({ state, api, reload }: { state: State; api: Api; reload: () => v
         </div>
       )}
       {!state.mustChange && <DesktopPassword state={state} api={api} reload={reload} />}
+      {!state.mustChange && <SystemUpdateSection />}
       <Account state={state} api={api} reload={reload} />
     </div>
+  );
+}
+
+type DeployData = {
+  running: boolean;
+  localCommit: string;
+  remoteCommit: string;
+  behind: number;
+  updateAvailable: boolean;
+  lastCheck: number | null;
+  lastResult: "ok" | "error" | null;
+  message: string;
+  buildId: string;
+  autoUpdate: boolean;
+  restartOnUpdate: boolean;
+  intervalMin: number;
+  remoteUrl: string;
+  branch?: string;
+  log: string;
+};
+
+function SystemUpdateSection() {
+  const [status, setStatus] = useState<DeployData | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<Msg>(null);
+
+  const fetchDeploy = useCallback(async (check = false) => {
+    try {
+      const sid = typeof window !== "undefined" ? window.sessionStorage.getItem("wd_admin_session") : null;
+      const res = await fetch(`/api/deploy?check=${check ? "1" : "0"}`, {
+        cache: "no-store",
+        headers: sid ? { "X-Admin-Session": sid } : {},
+      });
+      if (!res.ok) return;
+      const d = (await res.json()) as DeployData;
+      setStatus(d);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    void fetchDeploy(true);
+    const onUpdated = () => void fetchDeploy(false);
+    window.addEventListener("wd-deploy-updated", onUpdated);
+    return () => window.removeEventListener("wd-deploy-updated", onUpdated);
+  }, [fetchDeploy]);
+
+  useEffect(() => {
+    if (!status?.running) return;
+    const t = window.setInterval(() => void fetchDeploy(false), 1500);
+    return () => window.clearInterval(t);
+  }, [status?.running, fetchDeploy]);
+
+  const act = async (action: "check" | "apply" | "force-apply" | "config", extra?: Record<string, unknown>) => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const sid = typeof window !== "undefined" ? window.sessionStorage.getItem("wd_admin_session") : null;
+      const res = await fetch("/api/deploy", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(sid ? { "X-Admin-Session": sid } : {}),
+        },
+        body: JSON.stringify({ action, ...extra }),
+      });
+      const d = (await res.json()) as DeployData & { error?: string };
+      if (!res.ok) {
+        setMsg({ kind: "err", text: d.error || "操作失败" });
+      } else {
+        setStatus(d);
+        if (action === "check") {
+          setMsg({ kind: "ok", text: d.message || "已完成上游检查" });
+        } else if (action === "apply" || action === "force-apply") {
+          setMsg({ kind: "ok", text: "已启动更新同步任务，请查看下方实时日志" });
+        } else if (action === "config") {
+          setMsg({ kind: "ok", text: "自动更新设置已保存" });
+        }
+      }
+    } catch {
+      setMsg({ kind: "err", text: "网络请求失败，请稍后重试" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className={card}>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-base font-semibold">服务自动更新与版本同步</h2>
+          <p className="text-xs text-slate-400">
+            上游仓库：{status?.remoteUrl || "https://github.com/nocproen/des11.git"}（分支：{status?.branch || "master"}）
+          </p>
+        </div>
+        {status && (
+          <span
+            className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+              status.running
+                ? "bg-sky-500/20 text-sky-300"
+                : status.updateAvailable
+                  ? "bg-amber-500/20 text-amber-300"
+                  : status.lastResult === "error"
+                    ? "bg-rose-500/20 text-rose-300"
+                    : "bg-emerald-500/20 text-emerald-300"
+            }`}
+          >
+            {status.running
+              ? "正在更新…"
+              : status.updateAvailable
+                ? `发现 ${status.behind} 个新提交`
+                : "已是最新版本"}
+          </span>
+        )}
+      </div>
+
+      {status && (
+        <div className="mb-4 grid grid-cols-2 gap-3 rounded-xl border border-white/10 bg-black/30 p-3.5 text-xs sm:grid-cols-4">
+          <div>
+            <div className="text-slate-500">当前版本</div>
+            <div className="mt-1 font-mono text-slate-200">{status.localCommit ? status.localCommit.slice(0, 8) : "—"}</div>
+          </div>
+          <div>
+            <div className="text-slate-500">远端版本</div>
+            <div className="mt-1 font-mono text-slate-200">{status.remoteCommit ? status.remoteCommit.slice(0, 8) : "—"}</div>
+          </div>
+          <div>
+            <div className="text-slate-500">自动更新巡检</div>
+            <div className="mt-1 text-slate-200">
+              {status.autoUpdate ? `开启（每 ${status.intervalMin} 分钟）` : "已关闭"}
+            </div>
+          </div>
+          <div>
+            <div className="text-slate-500">最近检查</div>
+            <div className="mt-1 text-slate-200">
+              {status.lastCheck ? new Date(status.lastCheck).toLocaleTimeString("zh-CN", { hour12: false }) : "—"}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {status?.message && (
+        <div className="mb-3 rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-xs text-slate-300">
+          状态：{status.message}
+        </div>
+      )}
+
+      <Notice msg={msg} />
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          disabled={busy || status?.running}
+          onClick={() => void act("check")}
+          className={`${btn} bg-white/10 hover:bg-white/20`}
+        >
+          检查上游更新
+        </button>
+        <button
+          type="button"
+          disabled={busy || status?.running}
+          onClick={() => void act("apply")}
+          className={`${btn} bg-sky-500 text-white hover:bg-sky-400`}
+        >
+          {status?.running ? "正在更新…" : status?.updateAvailable ? "立即拉取并更新网站" : "立即同步校验"}
+        </button>
+        <button
+          type="button"
+          disabled={busy || status?.running}
+          onClick={() => void act("force-apply")}
+          className={`${btn} bg-violet-500/25 text-violet-200 hover:bg-violet-500/35`}
+        >
+          强制重新构建
+        </button>
+        {status && (
+          <button
+            type="button"
+            disabled={busy || status.running}
+            onClick={() => void act("config", { autoUpdate: !status.autoUpdate })}
+            className={`${btn} ml-auto bg-white/10 hover:bg-white/20`}
+          >
+            {status.autoUpdate ? "关闭自动更新" : "开启自动更新"}
+          </button>
+        )}
+      </div>
+
+      {status?.log && (
+        <div className="mt-4">
+          <div className="mb-1.5 text-xs text-slate-400">更新执行日志</div>
+          <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-xl border border-white/10 bg-black/40 p-3 font-mono text-[11px] leading-relaxed text-slate-300">
+            {status.log.slice(-3500)}
+          </pre>
+        </div>
+      )}
+    </section>
   );
 }
 

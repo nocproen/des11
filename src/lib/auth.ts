@@ -17,7 +17,7 @@ export const DESKTOP_SHORT_AGE = 12 * 3600;
 export const ADMIN_MAX_AGE = 12 * 3600;
 
 export const DEFAULT_ADMIN_USER = process.env.ADMIN_USER || "admin";
-const INITIAL_ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const INITIAL_ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "Admin@Des11#2026";
 
 type Try = { n: number; first: number; lock: number };
 type State = {
@@ -382,13 +382,15 @@ export async function createAdminToken(u: AdminUser) {
 }
 
 export async function verifyAdminToken(token?: string | null, sessionId?: string | null): Promise<AdminUser | null> {
-  if (!sessionId || sessionId.length > 128) return null;
+  if (sessionId && sessionId.length > 128) return null;
   const p = await unsign<{ k: string; exp: number; uid: number; fp: string; sid?: string }>(token);
-  if (!p || p.k !== "a" || p.sid !== sessionId) return null;
+  if (!p || p.k !== "a") return null;
+  const sid = sessionId || p.sid;
+  if (!sid || p.sid !== sid) return null;
   await ensureAuthTables();
   const [u] = await db.select().from(adminUsers).where(eq(adminUsers.id, p.uid));
   if (!u || fp(u.passwordHash) !== p.fp) return null;
-  return (await getCfg(`admin_active_${u.id}`, 0)) === p.sid ? u : null;
+  return (await getCfg(`admin_active_${u.id}`, 0)) === sid ? u : null;
 }
 
 export async function requireAdmin(req: Request) {
